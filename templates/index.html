@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KoeLog - 会議録音 文字起こし</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: "Noto Sans JP", sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+
+        header {
+            padding: 32px 10%;
+            border-bottom: 1px solid #2a2a4a;
+        }
+
+        header h1 {
+            font-size: 28px;
+            font-weight: 700;
+            color: #7c8cf8;
+            letter-spacing: 2px;
+        }
+
+        header p {
+            font-size: 14px;
+            color: #8888aa;
+            margin-top: 4px;
+        }
+
+        .container {
+            padding: 32px 10%;
+        }
+
+        /* --- アップロードエリア --- */
+        .upload-section {
+            margin-bottom: 40px;
+        }
+
+        .upload-section h2 {
+            font-size: 18px;
+            font-weight: 500;
+            margin-bottom: 16px;
+            color: #c0c0e0;
+        }
+
+        .dropzone {
+            border: 2px dashed #3a3a5e;
+            border-radius: 12px;
+            padding: 48px 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+            background: #16162b;
+        }
+
+        .dropzone:hover,
+        .dropzone.dragover {
+            border-color: #7c8cf8;
+            background: #1e1e3a;
+        }
+
+        .dropzone-icon {
+            font-size: 48px;
+            margin-bottom: 12px;
+        }
+
+        .dropzone-text {
+            font-size: 15px;
+            color: #8888aa;
+            margin-bottom: 8px;
+        }
+
+        .dropzone-sub {
+            font-size: 12px;
+            color: #666688;
+        }
+
+        .selected-file {
+            margin-top: 12px;
+            font-size: 14px;
+            color: #7c8cf8;
+            min-height: 20px;
+        }
+
+        .upload-actions {
+            margin-top: 16px;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 10px 24px;
+            border: none;
+            border-radius: 8px;
+            font-family: "Noto Sans JP", sans-serif;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s, opacity 0.2s;
+            text-decoration: none;
+        }
+
+        .btn-primary {
+            background: #7c8cf8;
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            background: #6a7ae6;
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .btn-danger {
+            background: #e05555;
+            color: #fff;
+            padding: 6px 14px;
+            font-size: 13px;
+        }
+
+        .btn-danger:hover {
+            background: #c94444;
+        }
+
+        .btn-download {
+            background: #4caf84;
+            color: #fff;
+            padding: 6px 14px;
+            font-size: 13px;
+        }
+
+        .btn-download:hover {
+            background: #3d9b72;
+        }
+
+        /* --- ジョブ一覧 --- */
+        .jobs-section h2 {
+            font-size: 18px;
+            font-weight: 500;
+            margin-bottom: 16px;
+            color: #c0c0e0;
+        }
+
+        .jobs-table-wrapper {
+            overflow-x: auto;
+        }
+
+        .jobs-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .jobs-table th {
+            text-align: left;
+            padding: 12px 16px;
+            font-size: 13px;
+            font-weight: 500;
+            color: #8888aa;
+            border-bottom: 1px solid #2a2a4a;
+            white-space: nowrap;
+        }
+
+        .jobs-table td {
+            padding: 12px 16px;
+            font-size: 14px;
+            border-bottom: 1px solid #222244;
+            vertical-align: middle;
+        }
+
+        .jobs-table tr:hover {
+            background: #1e1e36;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        .status-waiting {
+            background: #3a3a5e;
+            color: #aaaacc;
+        }
+
+        .status-processing {
+            background: #1e3a6e;
+            color: #6eaaff;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        .status-completed {
+            background: #1e4e3a;
+            color: #6ee0a8;
+        }
+
+        .status-failed {
+            background: #4e1e1e;
+            color: #ff6e6e;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .empty-message {
+            text-align: center;
+            padding: 48px 0;
+            color: #666688;
+            font-size: 14px;
+        }
+
+        .filename-cell {
+            max-width: 300px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .error-text {
+            font-size: 12px;
+            color: #ff6e6e;
+            margin-top: 4px;
+        }
+
+        /* --- レスポンシブ --- */
+        @media (max-width: 768px) {
+            header {
+                padding: 24px 5%;
+            }
+
+            .container {
+                padding: 24px 5%;
+            }
+
+            .dropzone {
+                padding: 32px 16px;
+            }
+
+            .jobs-table th,
+            .jobs-table td {
+                padding: 10px 8px;
+                font-size: 13px;
+            }
+
+            .filename-cell {
+                max-width: 160px;
+            }
+        }
+
+        /* --- フォーム非表示 --- */
+        .file-input-hidden {
+            display: none;
+        }
+
+        .hidden-element {
+            display: none !important;
+        }
+
+        /* --- 削除フォーム --- */
+        .delete-form {
+            display: inline;
+        }
+
+        /* --- アップロードプログレス --- */
+        .upload-progress {
+            margin-top: 12px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .upload-progress-bar-container {
+            flex: 1;
+            height: 8px;
+            background: #2a2a4a;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .upload-progress-bar {
+            height: 100%;
+            background: #7c8cf8;
+            border-radius: 4px;
+            transition: width 0.2s;
+            width: 0%;
+        }
+
+        .upload-progress-text {
+            font-size: 13px;
+            color: #7c8cf8;
+            min-width: 40px;
+            text-align: right;
+        }
+
+        /* --- プレビューモーダル --- */
+        .preview-modal {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+
+        .preview-card {
+            background: #1e1e36;
+            border: 1px solid #3a3a5e;
+            border-radius: 12px;
+            width: 90%;
+            max-height: 80vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .preview-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 24px;
+            border-bottom: 1px solid #2a2a4a;
+        }
+
+        .preview-title {
+            font-size: 16px;
+            color: #c0c0e0;
+        }
+
+        .preview-close {
+            background: none;
+            border: none;
+            color: #8888aa;
+            font-size: 24px;
+            cursor: pointer;
+        }
+
+        .preview-close:hover {
+            color: #e0e0e0;
+        }
+
+        .preview-content {
+            padding: 24px;
+            overflow-y: auto;
+            font-family: "Noto Sans JP", monospace;
+            font-size: 14px;
+            line-height: 1.8;
+            color: #e0e0e0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        /* --- プレビュー・経過時間 --- */
+        .btn-preview {
+            background: #3a6ea5;
+            color: #fff;
+            padding: 6px 14px;
+            font-size: 13px;
+        }
+
+        .btn-preview:hover {
+            background: #2d5a8a;
+        }
+
+        .elapsed-text {
+            font-size: 11px;
+            color: #8888aa;
+            margin-top: 2px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>KoeLog</h1>
+        <p>会議録音 文字起こし</p>
+    </header>
+
+    <div class="container">
+        <!-- アップロードセクション -->
+        <section class="upload-section">
+            <h2>音声ファイルをアップロード</h2>
+            <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data">
+                <div id="dropzone" class="dropzone">
+                    <div class="dropzone-icon">&#127908;</div>
+                    <div class="dropzone-text">ファイルをドラッグ&ドロップ、またはクリックして選択</div>
+                    <div class="dropzone-sub">対応形式: {{ allowed_extensions }} / 最大 {{ max_file_size_mb }}MB</div>
+                    <input type="file" name="file" id="file-input" class="file-input-hidden"
+                           accept=".mp3,.wav,.m4a,.ogg,.flac,.webm">
+                </div>
+                <div id="selected-file" class="selected-file"></div>
+                <div class="upload-actions">
+                    <button type="submit" id="upload-btn" class="btn btn-primary" disabled>文字起こし開始</button>
+                </div>
+                <div id="upload-progress" class="upload-progress hidden-element">
+                    <div class="upload-progress-bar-container">
+                        <div id="upload-progress-bar" class="upload-progress-bar"></div>
+                    </div>
+                    <span id="upload-progress-text" class="upload-progress-text">0%</span>
+                </div>
+            </form>
+        </section>
+
+        <!-- ジョブ一覧セクション -->
+        <section class="jobs-section">
+            <h2>ジョブ一覧</h2>
+            <div class="jobs-table-wrapper">
+                <table class="jobs-table">
+                    <thead>
+                        <tr>
+                            <th>ファイル名</th>
+                            <th>サイズ</th>
+                            <th>状態</th>
+                            <th>登録日時</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="jobs-tbody">
+                        {% if jobs %}
+                            {% for job in jobs %}
+                            <tr>
+                                <td class="filename-cell" title="{{ job.filename }}">{{ job.filename }}</td>
+                                <td>{{ job.file_size_mb }} MB</td>
+                                <td>
+                                    {% if job.status == "waiting" %}
+                                        <span class="status-badge status-waiting">待機中</span>
+                                    {% elif job.status == "processing" %}
+                                        <span class="status-badge status-processing">処理中</span>
+                                    {% elif job.status == "completed" %}
+                                        <span class="status-badge status-completed">完了</span>
+                                    {% elif job.status == "failed" %}
+                                        <span class="status-badge status-failed">失敗</span>
+                                        {% if job.error %}
+                                        <div class="error-text">{{ job.error }}</div>
+                                        {% endif %}
+                                    {% endif %}
+                                </td>
+                                <td>{{ job.created_at }}</td>
+                                <td>
+                                    <div class="actions">
+                                        {% if job.status == "completed" %}
+                                        <button onclick="openPreview('{{ job.job_id }}')" class="btn btn-preview">プレビュー</button>
+                                        <a href="/download/{{ job.job_id }}" class="btn btn-download">ダウンロード</a>
+                                        {% endif %}
+                                        {% if job.status != "processing" %}
+                                        <form action="/delete/{{ job.job_id }}" method="post" class="delete-form"
+                                              onsubmit="return confirm('このジョブを削除しますか？');">
+                                            <button type="submit" class="btn btn-danger">削除</button>
+                                        </form>
+                                        {% endif %}
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        {% else %}
+                            <tr>
+                                <td colspan="5" class="empty-message">ジョブはまだありません</td>
+                            </tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+
+    <div id="preview-modal" class="preview-modal hidden-element">
+        <div class="preview-card">
+            <div class="preview-header">
+                <h3 id="preview-title" class="preview-title"></h3>
+                <button id="preview-close" class="preview-close">&times;</button>
+            </div>
+            <pre id="preview-content" class="preview-content"></pre>
+        </div>
+    </div>
+
+    <script>
+        var dropzone = document.getElementById('dropzone');
+        var fileInput = document.getElementById('file-input');
+        var selectedFile = document.getElementById('selected-file');
+        var uploadBtn = document.getElementById('upload-btn');
+
+        // クリックでファイル選択
+        dropzone.addEventListener('click', function() {
+            fileInput.click();
+        });
+
+        // ドラッグ&ドロップ
+        dropzone.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            dropzone.classList.add('dragover');
+        });
+
+        dropzone.addEventListener('dragleave', function() {
+            dropzone.classList.remove('dragover');
+        });
+
+        dropzone.addEventListener('drop', function(e) {
+            e.preventDefault();
+            dropzone.classList.remove('dragover');
+            fileInput.files = e.dataTransfer.files;
+            onFileSelected();
+        });
+
+        // ファイル選択時
+        fileInput.addEventListener('change', function() {
+            onFileSelected();
+        });
+
+        function onFileSelected() {
+            if (fileInput.files.length > 0) {
+                var file = fileInput.files[0];
+                var sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+                selectedFile.textContent = file.name + ' (' + sizeMB + ' MB)';
+                uploadBtn.disabled = false;
+            } else {
+                selectedFile.textContent = '';
+                uploadBtn.disabled = true;
+            }
+        }
+
+        // アップロード（fetchでプログレス付き）
+        document.getElementById('upload-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            var formData = new FormData(this);
+            uploadBtn.disabled = true;
+            uploadBtn.textContent = 'アップロード中...';
+
+            var progressContainer = document.getElementById('upload-progress');
+            var progressBar = document.getElementById('upload-progress-bar');
+            var progressText = document.getElementById('upload-progress-text');
+            progressContainer.classList.remove('hidden-element');
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', '/upload', true);
+
+            xhr.upload.addEventListener('progress', function(e) {
+                if (e.lengthComputable) {
+                    var pct = Math.round((e.loaded / e.total) * 100);
+                    progressBar.style.width = pct + '%';
+                    progressText.textContent = pct + '%';
+                }
+            });
+
+            xhr.onload = function() {
+                progressContainer.classList.add('hidden-element');
+                progressBar.style.width = '0%';
+                uploadBtn.textContent = '文字起こし開始';
+                uploadBtn.disabled = true;
+                selectedFile.textContent = '';
+                fileInput.value = '';
+                refreshStatus();
+            };
+
+            xhr.onerror = function() {
+                progressContainer.classList.add('hidden-element');
+                alert('アップロードに失敗しました');
+                uploadBtn.textContent = '文字起こし開始';
+                uploadBtn.disabled = false;
+            };
+
+            xhr.send(formData);
+        });
+
+        // ジョブ一覧の自動更新
+        var statusLabels = {
+            'waiting': '<span class="status-badge status-waiting">待機中</span>',
+            'processing': '<span class="status-badge status-processing">処理中</span>',
+            'completed': '<span class="status-badge status-completed">完了</span>',
+            'failed': '<span class="status-badge status-failed">失敗</span>'
+        };
+
+        function escapeHtml(text) {
+            var div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function refreshStatus() {
+            fetch('/status')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var tbody = document.getElementById('jobs-tbody');
+                    if (data.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="5" class="empty-message">ジョブはまだありません</td></tr>';
+                        return;
+                    }
+                    var html = '';
+                    for (var i = 0; i < data.length; i++) {
+                        var job = data[i];
+                        html += '<tr>';
+                        html += '<td class="filename-cell" title="' + escapeHtml(job.filename) + '">' + escapeHtml(job.filename) + '</td>';
+                        html += '<td>' + (job.file_size_mb || 0) + ' MB</td>';
+                        html += '<td>' + statusLabels[job.status];
+                        if (job.status === 'failed' && job.error) {
+                            html += '<div class="error-text">' + escapeHtml(job.error) + '</div>';
+                        }
+                        if (job.status === 'processing' && job.created_at) {
+                            var elapsed = Math.floor((Date.now() - new Date(job.created_at.replace(' ', 'T')).getTime()) / 1000);
+                            var min = Math.floor(elapsed / 60);
+                            var sec = elapsed % 60;
+                            html += '<div class="elapsed-text">' + min + '分' + sec + '秒経過</div>';
+                        }
+                        if (job.status === 'completed' && job.created_at && job.completed_at) {
+                            var start = new Date(job.created_at.replace(' ', 'T')).getTime();
+                            var end = new Date(job.completed_at.replace(' ', 'T')).getTime();
+                            var duration = Math.floor((end - start) / 1000);
+                            var dMin = Math.floor(duration / 60);
+                            var dSec = duration % 60;
+                            html += '<div class="elapsed-text">' + dMin + '分' + dSec + '秒</div>';
+                        }
+                        html += '</td>';
+                        html += '<td>' + escapeHtml(job.created_at) + '</td>';
+                        html += '<td><div class="actions">';
+                        if (job.status === 'completed') {
+                            html += '<button onclick="openPreview(\'' + job.job_id + '\')" class="btn btn-preview">プレビュー</button>';
+                            html += '<a href="/download/' + job.job_id + '" class="btn btn-download">ダウンロード</a>';
+                        }
+                        if (job.status !== 'processing') {
+                            html += '<form action="/delete/' + job.job_id + '" method="post" class="delete-form" onsubmit="return confirm(\'このジョブを削除しますか？\');">';
+                            html += '<button type="submit" class="btn btn-danger">削除</button>';
+                            html += '</form>';
+                        }
+                        html += '</div></td>';
+                        html += '</tr>';
+                    }
+                    tbody.innerHTML = html;
+                })
+                .catch(function(err) {
+                    console.error('Status refresh failed:', err);
+                });
+        }
+
+        setInterval(refreshStatus, 5000);
+
+        // プレビューモーダル
+        function openPreview(jobId) {
+            fetch('/preview/' + jobId)
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    document.getElementById('preview-title').textContent = data.filename;
+                    document.getElementById('preview-content').textContent = data.text;
+                    document.getElementById('preview-modal').classList.remove('hidden-element');
+                })
+                .catch(function() { alert('プレビューの取得に失敗しました'); });
+        }
+
+        document.getElementById('preview-close').addEventListener('click', function() {
+            document.getElementById('preview-modal').classList.add('hidden-element');
+        });
+
+        document.getElementById('preview-modal').addEventListener('click', function(e) {
+            if (e.target === this) this.classList.add('hidden-element');
+        });
+    </script>
+</body>
+</html>
