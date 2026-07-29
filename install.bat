@@ -1,97 +1,98 @@
 @echo off
-chcp 65001 >nul
 echo ========================================
-echo   KoeLog インストーラー
+echo   KoeLog Installer
 echo ========================================
 echo.
 
-REM Python確認
+REM Check Python
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo [エラー] Pythonが見つかりません。
-    echo Python 3.9以上をインストールしてください。
+    echo [ERROR] Python not found.
+    echo Please install Python 3.9 or later.
     echo https://www.python.org/downloads/
     pause
     exit /b 1
 )
-echo [OK] Python確認済み
+echo [OK] Python found
 python --version
 
-REM 仮想環境作成
+REM Create virtual environment
 if not exist "venv" (
     echo.
-    echo [1/3] 仮想環境を作成中...
+    echo [1/3] Creating virtual environment...
     python -m venv venv
-    echo [OK] 仮想環境作成完了
+    if errorlevel 1 (
+        echo [ERROR] Failed to create virtual environment.
+        pause
+        exit /b 1
+    )
+    echo [OK] Virtual environment created
 ) else (
-    echo [OK] 仮想環境は既に存在します
+    echo [OK] Virtual environment already exists
 )
 
-REM パッケージインストール
+REM Install packages
 echo.
-echo [2/3] パッケージをインストール中...
-echo       （初回はWhisperモデルのダウンロードに時間がかかります）
+echo [2/3] Installing packages...
+echo       (First run will download Whisper model ~500MB)
 venv\Scripts\pip install -r requirements.txt
 if errorlevel 1 (
-    echo [エラー] パッケージのインストールに失敗しました。
+    echo [ERROR] Package installation failed.
     pause
     exit /b 1
 )
-echo [OK] パッケージインストール完了
+echo [OK] Packages installed
 
-REM ffmpeg確認+ダウンロード
+REM Check/Download ffmpeg
 echo.
-echo [3/3] ffmpegを確認中...
+echo [3/3] Checking ffmpeg...
 where ffmpeg >nul 2>&1
 if not errorlevel 1 (
-    echo [OK] ffmpegはPATHに存在します
+    echo [OK] ffmpeg found in PATH
     goto :ffmpeg_done
 )
 
 if exist "ffmpeg\bin\ffmpeg.exe" (
-    echo [OK] ffmpegは既にダウンロード済みです
+    echo [OK] ffmpeg already downloaded
     goto :ffmpeg_done
 )
 
-echo       ffmpegをダウンロード中...
+echo       Downloading ffmpeg...
 if not exist "ffmpeg" mkdir ffmpeg
 
-REM curlでダウンロード（Windows 10以降は標準搭載）
 curl -L -o ffmpeg\ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
 if errorlevel 1 (
-    echo [警告] ffmpegのダウンロードに失敗しました。
-    echo        ffmpegなしでも動作しますが、精度向上の前処理が無効になります。
+    echo [WARN] ffmpeg download failed.
+    echo        KoeLog will still work, but audio preprocessing will be skipped.
     goto :ffmpeg_done
 )
 
-echo       展開中...
+echo       Extracting...
 powershell -Command "Expand-Archive -Path 'ffmpeg\ffmpeg.zip' -DestinationPath 'ffmpeg\temp' -Force"
 
-REM 展開されたフォルダからbinを移動
 for /d %%d in (ffmpeg\temp\ffmpeg-*) do (
     if exist "%%d\bin" (
         xcopy "%%d\bin\*" "ffmpeg\bin\" /E /Y /Q >nul
     )
 )
 
-REM 後片付け
 del ffmpeg\ffmpeg.zip 2>nul
 rmdir /s /q ffmpeg\temp 2>nul
 
 if exist "ffmpeg\bin\ffmpeg.exe" (
-    echo [OK] ffmpegインストール完了
+    echo [OK] ffmpeg installed
 ) else (
-    echo [警告] ffmpegの展開に失敗しました。手動でインストールしてください。
+    echo [WARN] ffmpeg extraction failed. Please install manually.
 )
 
 :ffmpeg_done
 
 echo.
 echo ========================================
-echo   インストール完了！
+echo   Installation complete!
 echo ========================================
 echo.
-echo   起動方法: start.bat をダブルクリック
-echo   ブラウザ: http://localhost:8000
+echo   Start: double-click start.bat
+echo   Browser: http://localhost:8000
 echo.
 pause
