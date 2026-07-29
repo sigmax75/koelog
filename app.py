@@ -3,6 +3,7 @@
 import os
 import uuid
 import threading
+import subprocess
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -77,6 +78,80 @@ def format_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def format_srt_timestamp(seconds: float) -> str:
+    """SRT形式のタイムスタンプ（HH:MM:SS,mmm）"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def format_result(segments_data, output_format):
+    """出力形式に応じたテキストを生成"""
+    if output_format == "plain":
+        # プレーンテキスト（タイムスタンプなし）
+        return "\n".join(seg["text"] for seg in segments_data)
+    elif output_format == "srt":
+        # SRT字幕形式
+        lines = []
+        for i, seg in enumerate(segments_data, 1):
+            start_srt = format_srt_timestamp(seg["start"])
+            end_srt = format_srt_timestamp(seg["end"])
+            lines.append(str(i))
+            lines.append(f"{start_srt} --> {end_srt}")
+            lines.append(seg["text"])
+            lines.append("")
+        return "\n".join(lines)
+    else:
+        # タイムスタンプ付き（デフォルト）
+        return "\n".join(f"[{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}] {seg['text']}" for seg in segments_data)
+
+
+def preprocess_audio(input_path: str) -> str:
+    """ffmpegで16kHz/モノラル/ノーマライズに変換"""
+    output_path = input_path + ".preprocessed.wav"
+    try:
+        cmd = [
+            config.FFMPEG_PATH, "-y", "-i", input_path,
+            "-ar", "16000",      # 16kHzリサンプリング
+            "-ac", "1",          # モノラル
+            "-af", "loudnorm",   # ラウドネスノーマライズ
+            "-f", "wav",
+            output_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0 and os.path.exists(output_path):
+            return output_path
+        else:
+            print(f"[KoeLog] ffmpeg前処理失敗（元ファイルを使用）: {result.stderr[:200]}")
+            return input_path
+    except FileNotFoundError:
+        print("[KoeLog] ffmpegが見つかりません。前処理をスキップします。")
+        return input_path
+    except Exception as e:
+        print(f"[KoeLog] ffmpeg前処理エラー: {e}")
+        return input_path
+
+
+def get_audio_duration(filepath: str) -> float:
+    """ffprobeで音声の長さ（秒）を取得"""
+    try:
+        cmd = [
+            config.FFMPEG_PATH.replace("ffmpeg", "ffprobe"),
+            "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            filepath
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except Exception as e:
+        print(f"[KoeLog] ffprobe error: {e}")
+    return 0.0
+
+
 def send_notification(to_email: str, job: dict):
     """完了通知メールを送信"""
     settings = load_settings()
@@ -132,23 +207,35 @@ def transcribe_worker(job_id: str, filepath: str):
     processing_semaphore.acquire()
     job["status"] = "processing"
 
+    preprocessed_path = None
     try:
+        # ffmpeg前処理
+        preprocessed_path = preprocess_audio(filepath)
+
         segments, info = model.transcribe(
-            filepath,
+            preprocessed_path,  # 前処理済みファイルを使用
             language=config.LANGUAGE,
             beam_size=5,
             vad_filter=True,
+            initial_prompt=config.INITIAL_PROMPT,
+            temperature=config.TEMPERATURE,
         )
 
-        result_path = os.path.join(config.RESULT_DIR, f"{job_id}.txt")
-        lines = []
+        # セグメントデータを収集
+        segments_data = []
         for segment in segments:
-            start_ts = format_timestamp(segment.start)
-            end_ts = format_timestamp(segment.end)
-            line = f"[{start_ts} --> {end_ts}] {segment.text.strip()}"
-            lines.append(line)
+            segments_data.append({
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text.strip(),
+            })
 
-        text = "\n".join(lines)
+        # 出力形式に応じたテキスト生成
+        output_format = job.get("output_format", "timestamp")
+        text = format_result(segments_data, output_format)
+
+        ext = ".srt" if output_format == "srt" else ".txt"
+        result_path = os.path.join(config.RESULT_DIR, f"{job_id}{ext}")
 
         # BOM付きUTF-8で保存
         with open(result_path, "w", encoding="utf-8-sig") as f:
@@ -166,6 +253,12 @@ def transcribe_worker(job_id: str, filepath: str):
         job["error"] = str(e)
         job["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     finally:
+        # 前処理ファイルを削除
+        if preprocessed_path and preprocessed_path != filepath and os.path.exists(preprocessed_path):
+            try:
+                os.remove(preprocessed_path)
+            except OSError:
+                pass
         processing_semaphore.release()
 
 
@@ -182,7 +275,7 @@ async def index(request: Request):
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), email: str = Form("")):
+async def upload(file: UploadFile = File(...), email: str = Form(""), output_format: str = Form("timestamp")):
     """音声ファイルアップロード → ジョブ作成"""
     # 拡張子チェック
     _, ext = os.path.splitext(file.filename or "")
@@ -212,6 +305,9 @@ async def upload(file: UploadFile = File(...), email: str = Form("")):
     with open(filepath, "wb") as f:
         f.write(contents)
 
+    # 音声の長さを取得
+    duration = get_audio_duration(filepath)
+
     jobs[job_id] = {
         "job_id": job_id,
         "filename": file.filename,
@@ -224,6 +320,9 @@ async def upload(file: UploadFile = File(...), email: str = Form("")):
         "upload_path": filepath,
         "file_size_mb": round(size_mb, 1),
         "email": email.strip(),
+        "output_format": output_format,
+        "duration_sec": round(duration, 1),
+        "estimated_sec": round(duration * 0.7, 0),
     }
 
     # バックグラウンドで文字起こし開始
@@ -248,6 +347,8 @@ async def status():
             "completed_at": j["completed_at"],
             "error": j["error"],
             "file_size_mb": j.get("file_size_mb", 0),
+            "duration_sec": j.get("duration_sec", 0),
+            "estimated_sec": j.get("estimated_sec", 0),
         })
     return JSONResponse(content=safe_list)
 
@@ -263,9 +364,10 @@ async def download(job_id: str):
     if not os.path.exists(job["result_path"]):
         raise HTTPException(status_code=404, detail="結果ファイルが見つかりません")
 
-    # ダウンロード用ファイル名: 元ファイル名.txt
+    # ダウンロード用ファイル名: 元ファイル名.txt or .srt
     original_name = os.path.splitext(job["filename"] or "result")[0]
-    download_name = f"{original_name}.txt"
+    ext = ".srt" if job.get("output_format") == "srt" else ".txt"
+    download_name = f"{original_name}{ext}"
 
     return FileResponse(
         path=job["result_path"],

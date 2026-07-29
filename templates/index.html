@@ -446,6 +446,48 @@
             margin-top: 4px;
             display: block;
         }
+
+        /* --- 出力形式選択 --- */
+        .format-select-area {
+            margin-top: 12px;
+        }
+
+        .format-select {
+            padding: 10px 14px;
+            background: #16162b;
+            border: 1px solid #3a3a5e;
+            border-radius: 8px;
+            color: #e0e0e0;
+            font-family: "Noto Sans JP", sans-serif;
+            font-size: 14px;
+        }
+
+        .format-select:focus {
+            outline: none;
+            border-color: #7c8cf8;
+        }
+
+        /* --- プレビューアクション --- */
+        .preview-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .btn-copy {
+            background: #3a6ea5;
+            color: #fff;
+            padding: 6px 16px;
+            font-size: 13px;
+        }
+
+        .btn-copy:hover {
+            background: #2d5a8a;
+        }
+
+        .btn-copy.copied {
+            background: #4caf84;
+        }
     </style>
 </head>
 <body>
@@ -475,6 +517,14 @@
                     <input type="email" name="email" id="email-input" class="email-input" placeholder="example@company.com">
                     <span class="email-hint">完了時にメールで通知します（管理画面でSMTP設定が必要です）</span>
                 </div>
+                <div class="format-select-area">
+                    <label for="format-select" class="email-label">出力形式</label>
+                    <select name="output_format" id="format-select" class="format-select">
+                        <option value="timestamp" selected>タイムスタンプ付き</option>
+                        <option value="plain">プレーンテキスト</option>
+                        <option value="srt">SRT字幕</option>
+                    </select>
+                </div>
                 <div class="upload-actions">
                     <button type="submit" id="upload-btn" class="btn btn-primary" disabled>文字起こし開始</button>
                 </div>
@@ -496,6 +546,7 @@
                         <tr>
                             <th>ファイル名</th>
                             <th>サイズ</th>
+                            <th>音声長</th>
                             <th>状態</th>
                             <th>登録日時</th>
                             <th>操作</th>
@@ -508,8 +559,18 @@
                                 <td class="filename-cell" title="{{ job.filename }}">{{ job.filename }}</td>
                                 <td>{{ job.file_size_mb }} MB</td>
                                 <td>
+                                    {% if job.duration_sec > 0 %}
+                                        {{ (job.duration_sec // 60)|int }}分{{ (job.duration_sec % 60)|int }}秒
+                                    {% else %}
+                                        -
+                                    {% endif %}
+                                </td>
+                                <td>
                                     {% if job.status == "waiting" %}
                                         <span class="status-badge status-waiting">待機中</span>
+                                        {% if job.estimated_sec > 0 %}
+                                        <div class="elapsed-text">推定 {{ (job.estimated_sec // 60)|int }}分{{ (job.estimated_sec % 60)|int }}秒</div>
+                                        {% endif %}
                                     {% elif job.status == "processing" %}
                                         <span class="status-badge status-processing">処理中</span>
                                     {% elif job.status == "completed" %}
@@ -540,7 +601,7 @@
                             {% endfor %}
                         {% else %}
                             <tr>
-                                <td colspan="5" class="empty-message">ジョブはまだありません</td>
+                                <td colspan="6" class="empty-message">ジョブはまだありません</td>
                             </tr>
                         {% endif %}
                     </tbody>
@@ -553,7 +614,10 @@
         <div class="preview-card">
             <div class="preview-header">
                 <h3 id="preview-title" class="preview-title"></h3>
-                <button id="preview-close" class="preview-close">&times;</button>
+                <div class="preview-actions">
+                    <button id="preview-copy" class="btn btn-copy">コピー</button>
+                    <button id="preview-close" class="preview-close">&times;</button>
+                </div>
             </div>
             <pre id="preview-content" class="preview-content"></pre>
         </div>
@@ -667,7 +731,7 @@
                 .then(function(data) {
                     var tbody = document.getElementById('jobs-tbody');
                     if (data.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="5" class="empty-message">ジョブはまだありません</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="6" class="empty-message">ジョブはまだありません</td></tr>';
                         return;
                     }
                     var html = '';
@@ -676,9 +740,22 @@
                         html += '<tr>';
                         html += '<td class="filename-cell" title="' + escapeHtml(job.filename) + '">' + escapeHtml(job.filename) + '</td>';
                         html += '<td>' + (job.file_size_mb || 0) + ' MB</td>';
+                        // 音声長
+                        if (job.duration_sec > 0) {
+                            var durMin = Math.floor(job.duration_sec / 60);
+                            var durSec = Math.floor(job.duration_sec % 60);
+                            html += '<td>' + durMin + '分' + durSec + '秒</td>';
+                        } else {
+                            html += '<td>-</td>';
+                        }
                         html += '<td>' + statusLabels[job.status];
                         if (job.status === 'failed' && job.error) {
                             html += '<div class="error-text">' + escapeHtml(job.error) + '</div>';
+                        }
+                        if (job.status === 'waiting' && job.estimated_sec > 0) {
+                            var estMin = Math.floor(job.estimated_sec / 60);
+                            var estSec = Math.floor(job.estimated_sec % 60);
+                            html += '<div class="elapsed-text">推定 ' + estMin + '分' + estSec + '秒</div>';
                         }
                         if (job.status === 'processing' && job.created_at) {
                             var elapsed = Math.floor((Date.now() - new Date(job.created_at.replace(' ', 'T')).getTime()) / 1000);
@@ -729,6 +806,21 @@
                 })
                 .catch(function() { alert('プレビューの取得に失敗しました'); });
         }
+
+        document.getElementById('preview-copy').addEventListener('click', function() {
+            var text = document.getElementById('preview-content').textContent;
+            navigator.clipboard.writeText(text).then(function() {
+                var btn = document.getElementById('preview-copy');
+                btn.textContent = 'コピー済み';
+                btn.classList.add('copied');
+                setTimeout(function() {
+                    btn.textContent = 'コピー';
+                    btn.classList.remove('copied');
+                }, 2000);
+            }).catch(function() {
+                alert('コピーに失敗しました');
+            });
+        });
 
         document.getElementById('preview-close').addEventListener('click', function() {
             document.getElementById('preview-modal').classList.add('hidden-element');
