@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KoeLog 管理</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: "Noto Sans JP", sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; }
+        header { padding: 32px 10%; border-bottom: 1px solid #2a2a4a; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+        header h1 { font-size: 28px; font-weight: 700; color: #7c8cf8; letter-spacing: 2px; }
+        .back-link { color: #7c8cf8; text-decoration: none; font-size: 14px; }
+        .back-link:hover { opacity: 0.7; }
+        .container { padding: 32px 10%; }
+
+        .section-title { font-size: 18px; font-weight: 500; color: #c0c0e0; margin-bottom: 20px; }
+
+        .form-group { margin-bottom: 20px; }
+        .form-label { font-size: 13px; color: #8888aa; display: block; margin-bottom: 6px; }
+        .form-input { width: 100%; max-width: 400px; padding: 10px 14px; background: #16162b; border: 1px solid #3a3a5e; border-radius: 8px; color: #e0e0e0; font-family: "Noto Sans JP", sans-serif; font-size: 14px; }
+        .form-input:focus { outline: none; border-color: #7c8cf8; }
+        .form-hint { font-size: 11px; color: #666688; margin-top: 4px; }
+
+        .port-input { max-width: 120px; }
+
+        .checkbox-group { display: flex; align-items: center; gap: 8px; }
+        .checkbox-group input[type="checkbox"] { accent-color: #7c8cf8; width: 18px; height: 18px; }
+        .checkbox-label { font-size: 14px; color: #c0c0e0; }
+
+        .btn { display: inline-block; padding: 10px 24px; border: none; border-radius: 8px; font-family: "Noto Sans JP", sans-serif; font-size: 14px; font-weight: 500; cursor: pointer; transition: background 0.2s; }
+        .btn-primary { background: #7c8cf8; color: #fff; }
+        .btn-primary:hover { background: #6a7ae6; }
+        .btn-secondary { background: #3a3a5e; color: #c0c0e0; }
+        .btn-secondary:hover { background: #4a4a6e; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .actions-row { display: flex; gap: 12px; margin-top: 24px; flex-wrap: wrap; align-items: center; }
+
+        .message { margin-top: 12px; padding: 10px 16px; border-radius: 8px; font-size: 14px; }
+        .message-success { background: #1e4e3a; color: #6ee0a8; }
+        .message-error { background: #4e1e1e; color: #ff6e6e; }
+        .hidden-element { display: none !important; }
+
+        .divider { border: none; border-top: 1px solid #2a2a4a; margin: 32px 0; }
+
+        .test-area { margin-top: 8px; }
+        .test-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+        .test-row .form-input { max-width: 300px; }
+
+        @media (max-width: 768px) {
+            header { padding: 24px 5%; }
+            .container { padding: 24px 5%; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>KoeLog 管理</h1>
+        <a href="/" class="back-link">← トップに戻る</a>
+    </header>
+    <div class="container">
+        <h2 class="section-title">メール通知設定</h2>
+
+        <form id="settings-form">
+            <div class="form-group">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="mail-enabled" name="mail_enabled" {% if settings.mail_enabled %}checked{% endif %}>
+                    <label for="mail-enabled" class="checkbox-label">メール通知を有効にする</label>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="smtp-host">SMTPホスト</label>
+                <input type="text" id="smtp-host" name="smtp_host" class="form-input" placeholder="smtp.gmail.com" value="{{ settings.smtp_host }}">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="smtp-port">SMTPポート</label>
+                <input type="number" id="smtp-port" name="smtp_port" class="form-input port-input" placeholder="587" value="{{ settings.smtp_port }}">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="smtp-user">ユーザー名（メールアドレス）</label>
+                <input type="text" id="smtp-user" name="smtp_user" class="form-input" placeholder="user@gmail.com" value="{{ settings.smtp_user }}">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="smtp-password">パスワード</label>
+                <input type="password" id="smtp-password" name="smtp_password" class="form-input" placeholder="アプリパスワード" value="{{ settings.smtp_password }}">
+                <span class="form-hint">Gmailの場合はアプリパスワードを使用してください</span>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="smtp-from">送信元アドレス（任意）</label>
+                <input type="text" id="smtp-from" name="smtp_from" class="form-input" placeholder="未設定ならユーザー名が使われます" value="{{ settings.smtp_from }}">
+            </div>
+
+            <div class="form-group">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="smtp-use-tls" name="smtp_use_tls" {% if settings.smtp_use_tls %}checked{% endif %}>
+                    <label for="smtp-use-tls" class="checkbox-label">TLSを使用（ポート587の場合はON）</label>
+                </div>
+            </div>
+
+            <div class="actions-row">
+                <button type="submit" class="btn btn-primary">設定を保存</button>
+            </div>
+            <div id="save-message" class="hidden-element"></div>
+        </form>
+
+        <hr class="divider">
+
+        <h2 class="section-title">テスト送信</h2>
+        <div class="test-area">
+            <div class="test-row">
+                <input type="email" id="test-email" class="form-input" placeholder="送信先メールアドレス">
+                <button id="test-btn" class="btn btn-secondary">テスト送信</button>
+            </div>
+            <div id="test-message" class="hidden-element"></div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('settings-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            var formData = new FormData(this);
+            if (!document.getElementById('mail-enabled').checked) formData.set('mail_enabled', 'off');
+            else formData.set('mail_enabled', 'on');
+            if (!document.getElementById('smtp-use-tls').checked) formData.set('smtp_use_tls', 'off');
+            else formData.set('smtp_use_tls', 'on');
+
+            fetch('/admin/save', { method: 'POST', body: formData })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var msg = document.getElementById('save-message');
+                    msg.classList.remove('hidden-element', 'message-success', 'message-error');
+                    if (data.status === 'ok') {
+                        msg.className = 'message message-success';
+                        msg.textContent = '設定を保存しました';
+                    } else {
+                        msg.className = 'message message-error';
+                        msg.textContent = data.message || '保存に失敗しました';
+                    }
+                })
+                .catch(function() {
+                    var msg = document.getElementById('save-message');
+                    msg.classList.remove('hidden-element');
+                    msg.className = 'message message-error';
+                    msg.textContent = '通信エラーが発生しました';
+                });
+        });
+
+        document.getElementById('test-btn').addEventListener('click', function() {
+            var email = document.getElementById('test-email').value.trim();
+            if (!email) { alert('送信先メールアドレスを入力してください'); return; }
+            var btn = this;
+            btn.disabled = true;
+            btn.textContent = '送信中...';
+            var formData = new FormData();
+            formData.append('test_email', email);
+
+            fetch('/admin/test', { method: 'POST', body: formData })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var msg = document.getElementById('test-message');
+                    msg.classList.remove('hidden-element', 'message-success', 'message-error');
+                    if (data.status === 'ok') {
+                        msg.className = 'message message-success';
+                    } else {
+                        msg.className = 'message message-error';
+                    }
+                    msg.textContent = data.message;
+                    btn.disabled = false;
+                    btn.textContent = 'テスト送信';
+                })
+                .catch(function() {
+                    var msg = document.getElementById('test-message');
+                    msg.classList.remove('hidden-element');
+                    msg.className = 'message message-error';
+                    msg.textContent = '通信エラーが発生しました';
+                    btn.disabled = false;
+                    btn.textContent = 'テスト送信';
+                });
+        });
+    </script>
+</body>
+</html>

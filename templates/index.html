@@ -23,6 +23,23 @@
         header {
             padding: 32px 10%;
             border-bottom: 1px solid #2a2a4a;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .admin-link {
+            color: #7c8cf8;
+            text-decoration: none;
+            font-size: 14px;
+            padding: 6px 16px;
+            border: 1px solid #3a3a5e;
+            border-radius: 8px;
+            transition: background 0.2s;
+        }
+
+        .admin-link:hover {
+            background: #1e1e3a;
         }
 
         header h1 {
@@ -393,12 +410,51 @@
             color: #8888aa;
             margin-top: 2px;
         }
+
+        /* --- メール入力 --- */
+        .email-input-area {
+            margin-top: 16px;
+        }
+
+        .email-label {
+            font-size: 13px;
+            color: #8888aa;
+            display: block;
+            margin-bottom: 6px;
+        }
+
+        .email-input {
+            width: 100%;
+            max-width: 400px;
+            padding: 10px 14px;
+            background: #16162b;
+            border: 1px solid #3a3a5e;
+            border-radius: 8px;
+            color: #e0e0e0;
+            font-family: "Noto Sans JP", sans-serif;
+            font-size: 14px;
+        }
+
+        .email-input:focus {
+            outline: none;
+            border-color: #7c8cf8;
+        }
+
+        .email-hint {
+            font-size: 11px;
+            color: #666688;
+            margin-top: 4px;
+            display: block;
+        }
     </style>
 </head>
 <body>
     <header>
-        <h1>KoeLog</h1>
-        <p>会議録音 文字起こし</p>
+        <div>
+            <h1>KoeLog</h1>
+            <p>会議録音 文字起こし</p>
+        </div>
+        <a href="/admin" class="admin-link">管理</a>
     </header>
 
     <div class="container">
@@ -414,6 +470,11 @@
                            accept=".mp3,.wav,.m4a,.ogg,.flac,.webm">
                 </div>
                 <div id="selected-file" class="selected-file"></div>
+                <div class="email-input-area">
+                    <label for="email-input" class="email-label">通知先メールアドレス（任意）</label>
+                    <input type="email" name="email" id="email-input" class="email-input" placeholder="example@company.com">
+                    <span class="email-hint">完了時にメールで通知します（管理画面でSMTP設定が必要です）</span>
+                </div>
                 <div class="upload-actions">
                     <button type="submit" id="upload-btn" class="btn btn-primary" disabled>文字起こし開始</button>
                 </div>
