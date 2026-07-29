@@ -8,3 +8,5 @@ dist/
 build/
 PCT/
 settings.json
+venv/
+ffmpeg/
