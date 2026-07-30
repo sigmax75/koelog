@@ -2,7 +2,7 @@ import os
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 RESULT_DIR = os.path.join(os.path.dirname(__file__), "results")
-MODEL_SIZE = "small"
+MODEL_SIZE = "medium"
 DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
 LANGUAGE = "ja"

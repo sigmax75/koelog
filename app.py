@@ -219,6 +219,10 @@ def transcribe_worker(job_id: str, filepath: str):
             vad_filter=True,
             initial_prompt=config.INITIAL_PROMPT,
             temperature=config.TEMPERATURE,
+            condition_on_previous_text=False,
+            hallucination_silence_threshold=2.0,
+            repetition_penalty=1.1,
+            no_repeat_ngram_size=3,
         )
 
         # セグメントデータを収集
@@ -322,7 +326,7 @@ async def upload(file: UploadFile = File(...), email: str = Form(""), output_for
         "email": email.strip(),
         "output_format": output_format,
         "duration_sec": round(duration, 1),
-        "estimated_sec": round(duration * 0.7, 0),
+        "estimated_sec": round(duration * 1.0, 0),
     }
 
     # バックグラウンドで文字起こし開始
