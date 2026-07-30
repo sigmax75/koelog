@@ -19,7 +19,7 @@ SMTP_USE_TLS = True
 MAIL_ENABLED = False    # TrueにするとSMTP設定が有効になる
 
 # --- Whisper精度設定 ---
-INITIAL_PROMPT = "会議の議事録です。ビジネス用語、専門用語が含まれます。"
+INITIAL_PROMPT = "会議の議事録です。ビジネス用語、医療用語、IT用語が含まれます。アレルギー、抗生剤、ばい菌、処方、診断、症状、治療、検査、手術、入院、退院、カルテ、レセプト、サーバー、データベース、デプロイ、リリース、スプリント、バックログ。"
 TEMPERATURE = 0.0
 
 # --- ffmpeg ---

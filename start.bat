@@ -1,4 +1,13 @@
 @echo off
+:: Self-elevate to admin if not already
+net session >nul 2>&1
+if errorlevel 1 (
+    powershell -Command "Start-Process '%~f0' -Verb RunAs -WorkingDirectory '%~dp0'"
+    exit /b
+)
+
+cd /d "%~dp0"
+
 echo ========================================
 echo   KoeLog Starting...
 echo ========================================
@@ -29,3 +38,4 @@ echo   Close this window to stop the server
 echo.
 
 venv\Scripts\python -m uvicorn app:app --host 0.0.0.0 --port 8000
+pause

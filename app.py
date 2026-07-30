@@ -217,6 +217,11 @@ def transcribe_worker(job_id: str, filepath: str):
             language=config.LANGUAGE,
             beam_size=5,
             vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=500,
+                speech_pad_ms=300,
+                threshold=0.5,
+            ),
             initial_prompt=config.INITIAL_PROMPT,
             temperature=config.TEMPERATURE,
             condition_on_previous_text=False,
