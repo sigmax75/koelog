@@ -220,7 +220,6 @@ def transcribe_worker(job_id: str, filepath: str):
             vad_parameters=dict(
                 min_silence_duration_ms=500,
                 speech_pad_ms=300,
-                threshold=0.5,
             ),
             initial_prompt=config.INITIAL_PROMPT,
             temperature=config.TEMPERATURE,
