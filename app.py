@@ -21,6 +21,7 @@ import config
 
 # --- 設定ファイル ---
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
+DICTIONARY_FILE = os.path.join(os.path.dirname(__file__), "dictionary.json")
 
 
 def load_settings():
@@ -48,6 +49,36 @@ def save_settings(data: dict):
     """settings.jsonに設定を保存"""
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# --- Custom Dictionary ---
+
+def load_dictionary():
+    """Load custom dictionary entries"""
+    if not os.path.exists(DICTIONARY_FILE):
+        return []
+    try:
+        with open(DICTIONARY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("entries", [])
+    except Exception:
+        return []
+
+
+def save_dictionary(entries):
+    """Save custom dictionary entries"""
+    data = {"version": 1, "entries": entries}
+    with open(DICTIONARY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def apply_dictionary(text):
+    """Apply dictionary replacements to text"""
+    entries = load_dictionary()
+    for entry in entries:
+        if entry.get("from") and entry.get("to"):
+            text = text.replace(entry["from"], entry["to"])
+    return text
 
 
 # --- ディレクトリ作成 ---
@@ -241,6 +272,9 @@ def transcribe_worker(job_id: str, filepath: str):
         # 出力形式に応じたテキスト生成
         output_format = job.get("output_format", "timestamp")
         text = format_result(segments_data, output_format)
+
+        # Apply custom dictionary post-processing
+        text = apply_dictionary(text)
 
         ext = ".srt" if output_format == "srt" else ".txt"
         result_path = os.path.join(config.RESULT_DIR, f"{job_id}{ext}")
@@ -491,3 +525,21 @@ async def admin_test(test_email: str = Form("")):
         return JSONResponse(content={"status": "ok", "message": "テストメールを送信しました"})
     except Exception as e:
         return JSONResponse(content={"status": "error", "message": f"送信失敗: {str(e)}"})
+
+
+@app.get("/admin/dictionary")
+async def admin_dictionary():
+    """Return dictionary entries as JSON"""
+    entries = load_dictionary()
+    return JSONResponse(content={"entries": entries})
+
+
+@app.post("/admin/dictionary/save")
+async def admin_dictionary_save(request: Request):
+    """Save dictionary entries"""
+    body = await request.json()
+    entries = body.get("entries", [])
+    # Validate: keep only entries with both from and to
+    valid = [e for e in entries if e.get("from") and e.get("to")]
+    save_dictionary(valid)
+    return JSONResponse(content={"status": "ok", "count": len(valid)})

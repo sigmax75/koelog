@@ -49,6 +49,55 @@
         .test-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
         .test-row .form-input { max-width: 300px; }
 
+        .dict-entry {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }
+
+        .dict-entry input {
+            padding: 8px 12px;
+            background: #16162b;
+            border: 1px solid #3a3a5e;
+            border-radius: 6px;
+            color: #e0e0e0;
+            font-family: "Noto Sans JP", sans-serif;
+            font-size: 13px;
+            width: 200px;
+        }
+
+        .dict-entry input:focus {
+            outline: none;
+            border-color: #7c8cf8;
+        }
+
+        .dict-arrow {
+            color: #7c8cf8;
+            font-size: 16px;
+        }
+
+        .dict-remove {
+            background: none;
+            border: 1px solid #4e1e1e;
+            color: #ff6e6e;
+            padding: 6px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+        .dict-remove:hover {
+            background: #4e1e1e;
+        }
+
+        .form-hint-block {
+            font-size: 13px;
+            color: #8888aa;
+            margin-bottom: 16px;
+        }
+
         @media (max-width: 768px) {
             header { padding: 24px 5%; }
             .container { padding: 24px 5%; }
@@ -120,6 +169,19 @@
             </div>
             <div id="test-message" class="hidden-element"></div>
         </div>
+
+        <hr class="divider">
+
+        <h2 class="section-title">Custom Dictionary</h2>
+        <p class="form-hint-block">Misrecognized words are automatically corrected using this dictionary.</p>
+
+        <div id="dict-entries"></div>
+
+        <div class="actions-row">
+            <button id="dict-add" class="btn btn-secondary">+ Add Entry</button>
+            <button id="dict-save" class="btn btn-primary">Save Dictionary</button>
+        </div>
+        <div id="dict-message" class="hidden-element"></div>
     </div>
 
     <script>
@@ -183,6 +245,89 @@
                     btn.disabled = false;
                     btn.textContent = 'テスト送信';
                 });
+        });
+
+        // Dictionary management
+        var dictContainer = document.getElementById('dict-entries');
+
+        function escapeAttr(s) {
+            return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function renderDictEntries(entries) {
+            dictContainer.innerHTML = '';
+            for (var i = 0; i < entries.length; i++) {
+                var row = document.createElement('div');
+                row.className = 'dict-entry';
+                row.innerHTML = '<input type="text" class="dict-from" placeholder="Before" value="' + escapeAttr(entries[i].from || '') + '">' +
+                    '<span class="dict-arrow">\u2192</span>' +
+                    '<input type="text" class="dict-to" placeholder="After" value="' + escapeAttr(entries[i].to || '') + '">' +
+                    '<button class="dict-remove" data-idx="' + i + '">x</button>';
+                dictContainer.appendChild(row);
+            }
+            var removeBtns = dictContainer.querySelectorAll('.dict-remove');
+            for (var r = 0; r < removeBtns.length; r++) {
+                removeBtns[r].addEventListener('click', function() {
+                    this.parentElement.remove();
+                });
+            }
+        }
+
+        function collectDictEntries() {
+            var rows = dictContainer.querySelectorAll('.dict-entry');
+            var entries = [];
+            for (var i = 0; i < rows.length; i++) {
+                var fromVal = rows[i].querySelector('.dict-from').value.trim();
+                var toVal = rows[i].querySelector('.dict-to').value.trim();
+                if (fromVal && toVal) {
+                    entries.push({from: fromVal, to: toVal});
+                }
+            }
+            return entries;
+        }
+
+        // Load dictionary on page load
+        fetch('/admin/dictionary')
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                renderDictEntries(data.entries || []);
+            });
+
+        // Add entry button
+        document.getElementById('dict-add').addEventListener('click', function() {
+            var row = document.createElement('div');
+            row.className = 'dict-entry';
+            row.innerHTML = '<input type="text" class="dict-from" placeholder="Before">' +
+                '<span class="dict-arrow">\u2192</span>' +
+                '<input type="text" class="dict-to" placeholder="After">' +
+                '<button class="dict-remove">x</button>';
+            row.querySelector('.dict-remove').addEventListener('click', function() {
+                this.parentElement.remove();
+            });
+            dictContainer.appendChild(row);
+            row.querySelector('.dict-from').focus();
+        });
+
+        // Save dictionary
+        document.getElementById('dict-save').addEventListener('click', function() {
+            var entries = collectDictEntries();
+            fetch('/admin/dictionary/save', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({entries: entries})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                var msg = document.getElementById('dict-message');
+                msg.classList.remove('hidden-element', 'message-success', 'message-error');
+                if (data.status === 'ok') {
+                    msg.className = 'message message-success';
+                    msg.textContent = 'Saved (' + data.count + ' entries)';
+                } else {
+                    msg.className = 'message message-error';
+                    msg.textContent = 'Save failed';
+                }
+            });
         });
     </script>
 </body>
