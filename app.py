@@ -243,6 +243,15 @@ def transcribe_worker(job_id: str, filepath: str):
         # ffmpeg前処理
         preprocessed_path = preprocess_audio(filepath)
 
+        # 分野別プロンプト選択
+        field = job.get("field", "general")
+        if field == "custom" and job.get("custom_prompt"):
+            prompt = job["custom_prompt"]
+        elif field in config.PROMPT_PRESETS:
+            prompt = config.PROMPT_PRESETS[field]
+        else:
+            prompt = config.INITIAL_PROMPT
+
         segments, info = model.transcribe(
             preprocessed_path,  # 前処理済みファイルを使用
             language=config.LANGUAGE,
@@ -252,7 +261,7 @@ def transcribe_worker(job_id: str, filepath: str):
                 min_silence_duration_ms=500,
                 speech_pad_ms=300,
             ),
-            initial_prompt=config.INITIAL_PROMPT,
+            initial_prompt=prompt,
             temperature=config.TEMPERATURE,
             condition_on_previous_text=False,
             hallucination_silence_threshold=2.0,
@@ -317,7 +326,7 @@ async def index(request: Request):
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), email: str = Form(""), output_format: str = Form("timestamp")):
+async def upload(file: UploadFile = File(...), email: str = Form(""), output_format: str = Form("timestamp"), field: str = Form("general"), custom_prompt: str = Form(""), username: str = Form("")):
     """音声ファイルアップロード → ジョブ作成"""
     # 拡張子チェック
     _, ext = os.path.splitext(file.filename or "")
@@ -365,6 +374,9 @@ async def upload(file: UploadFile = File(...), email: str = Form(""), output_for
         "output_format": output_format,
         "duration_sec": round(duration, 1),
         "estimated_sec": round(duration * 1.0, 0),
+        "field": field,
+        "custom_prompt": custom_prompt.strip(),
+        "username": username.strip() or "anonymous",
     }
 
     # バックグラウンドで文字起こし開始
@@ -391,6 +403,7 @@ async def status():
             "file_size_mb": j.get("file_size_mb", 0),
             "duration_sec": j.get("duration_sec", 0),
             "estimated_sec": j.get("estimated_sec", 0),
+            "username": j.get("username", "anonymous"),
         })
     return JSONResponse(content=safe_list)
 
@@ -430,7 +443,34 @@ async def preview(job_id: str):
         raise HTTPException(status_code=404, detail="結果ファイルが見つかりません")
     with open(job["result_path"], "r", encoding="utf-8-sig") as f:
         text = f.read()
-    return JSONResponse(content={"text": text, "filename": job["filename"]})
+    return JSONResponse(content={"text": text, "filename": job["filename"], "job_id": job_id})
+
+
+@app.get("/audio/{job_id}")
+async def audio(job_id: str):
+    """Stream audio file for playback"""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    upload_path = job.get("upload_path")
+    if not upload_path or not os.path.exists(upload_path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(path=upload_path, media_type="audio/mpeg")
+
+
+@app.post("/save/{job_id}")
+async def save_result(job_id: str, request: Request):
+    """Save edited result text"""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "completed" or not job["result_path"]:
+        raise HTTPException(status_code=400, detail="Job not completed")
+    body = await request.json()
+    text = body.get("text", "")
+    with open(job["result_path"], "w", encoding="utf-8-sig") as f:
+        f.write(text)
+    return JSONResponse(content={"status": "ok"})
 
 
 @app.post("/delete/{job_id}")

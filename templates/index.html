@@ -488,6 +488,57 @@
         .btn-copy.copied {
             background: #4caf84;
         }
+
+        /* --- 音声プレーヤー --- */
+        .preview-player {
+            padding: 12px 24px;
+            border-bottom: 1px solid #2a2a4a;
+        }
+
+        .preview-audio-el {
+            width: 100%;
+            height: 40px;
+        }
+
+        .timestamp-link {
+            color: #7c8cf8;
+            cursor: pointer;
+            text-decoration: none;
+        }
+
+        .timestamp-link:hover {
+            text-decoration: underline;
+            color: #9cacff;
+        }
+
+        /* --- 保存ボタン --- */
+        .btn-save {
+            background: #4caf84;
+            color: #fff;
+            padding: 6px 16px;
+            font-size: 13px;
+        }
+
+        .btn-save:hover {
+            background: #3d9b72;
+        }
+
+        .btn-save.saved {
+            background: #3a6ea5;
+        }
+
+        .preview-content[contenteditable="true"] {
+            outline: none;
+            border: 2px solid transparent;
+        }
+
+        .preview-content[contenteditable="true"]:focus {
+            border-color: #7c8cf8;
+        }
+
+        .preview-content.editing {
+            background: #161628;
+        }
     </style>
 </head>
 <body>
@@ -504,6 +555,10 @@
         <section class="upload-section">
             <h2>音声ファイルをアップロード</h2>
             <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data">
+                <div class="email-input-area">
+                    <label for="username-input" class="email-label">あなたの名前</label>
+                    <input type="text" name="username" id="username-input" class="email-input" placeholder="名前を入力（ジョブ一覧に表示されます）">
+                </div>
                 <div id="dropzone" class="dropzone">
                     <div class="dropzone-icon">&#127908;</div>
                     <div class="dropzone-text">ファイルをドラッグ&ドロップ、またはクリックして選択</div>
@@ -525,6 +580,21 @@
                         <option value="srt">SRT字幕</option>
                     </select>
                 </div>
+                <div class="format-select-area">
+                    <label for="field-select" class="email-label">分野</label>
+                    <select name="field" id="field-select" class="format-select">
+                        <option value="general" selected>一般ビジネス</option>
+                        <option value="medical">医療</option>
+                        <option value="it">IT・技術</option>
+                        <option value="legal">法務・契約</option>
+                        <option value="finance">財務・会計</option>
+                        <option value="custom">カスタム</option>
+                    </select>
+                </div>
+                <div id="custom-prompt-area" class="format-select-area hidden-element">
+                    <label for="custom-prompt" class="email-label">カスタムプロンプト</label>
+                    <input type="text" name="custom_prompt" id="custom-prompt" class="email-input" placeholder="認識精度を上げたい用語をカンマ区切りで入力">
+                </div>
                 <div class="upload-actions">
                     <button type="submit" id="upload-btn" class="btn btn-primary" disabled>文字起こし開始</button>
                 </div>
@@ -545,6 +615,7 @@
                     <thead>
                         <tr>
                             <th>ファイル名</th>
+                            <th>ユーザー</th>
                             <th>サイズ</th>
                             <th>音声長</th>
                             <th>状態</th>
@@ -557,6 +628,7 @@
                             {% for job in jobs %}
                             <tr>
                                 <td class="filename-cell" title="{{ job.filename }}">{{ job.filename }}</td>
+                                <td>{{ job.username }}</td>
                                 <td>{{ job.file_size_mb }} MB</td>
                                 <td>
                                     {% if job.duration_sec > 0 %}
@@ -601,7 +673,7 @@
                             {% endfor %}
                         {% else %}
                             <tr>
-                                <td colspan="6" class="empty-message">ジョブはまだありません</td>
+                                <td colspan="7" class="empty-message">ジョブはまだありません</td>
                             </tr>
                         {% endif %}
                     </tbody>
@@ -616,10 +688,14 @@
                 <h3 id="preview-title" class="preview-title"></h3>
                 <div class="preview-actions">
                     <button id="preview-copy" class="btn btn-copy">コピー</button>
+                    <button id="preview-save" class="btn btn-save hidden-element">保存</button>
                     <button id="preview-close" class="preview-close">&times;</button>
                 </div>
             </div>
-            <pre id="preview-content" class="preview-content"></pre>
+            <div class="preview-player">
+                <audio id="preview-audio" controls class="preview-audio-el"></audio>
+            </div>
+            <div id="preview-content" class="preview-content" contenteditable="true"></div>
         </div>
     </div>
 
@@ -628,6 +704,22 @@
         var fileInput = document.getElementById('file-input');
         var selectedFile = document.getElementById('selected-file');
         var uploadBtn = document.getElementById('upload-btn');
+        var currentPreviewJobId = null;
+
+        // ユーザー名をlocalStorageから復元
+        var usernameInput = document.getElementById('username-input');
+        var savedUsername = localStorage.getItem('koelog_username');
+        if (savedUsername) usernameInput.value = savedUsername;
+
+        // 分野選択でカスタムプロンプト表示切替
+        document.getElementById('field-select').addEventListener('change', function() {
+            var customArea = document.getElementById('custom-prompt-area');
+            if (this.value === 'custom') {
+                customArea.classList.remove('hidden-element');
+            } else {
+                customArea.classList.add('hidden-element');
+            }
+        });
 
         // クリックでファイル選択
         dropzone.addEventListener('click', function() {
@@ -671,6 +763,7 @@
         // アップロード（fetchでプログレス付き）
         document.getElementById('upload-form').addEventListener('submit', function(e) {
             e.preventDefault();
+            localStorage.setItem('koelog_username', document.getElementById('username-input').value.trim());
             var formData = new FormData(this);
             uploadBtn.disabled = true;
             uploadBtn.textContent = 'アップロード中...';
@@ -731,7 +824,7 @@
                 .then(function(data) {
                     var tbody = document.getElementById('jobs-tbody');
                     if (data.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="6" class="empty-message">ジョブはまだありません</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="7" class="empty-message">ジョブはまだありません</td></tr>';
                         return;
                     }
                     var html = '';
@@ -739,6 +832,7 @@
                         var job = data[i];
                         html += '<tr>';
                         html += '<td class="filename-cell" title="' + escapeHtml(job.filename) + '">' + escapeHtml(job.filename) + '</td>';
+                        html += '<td>' + escapeHtml(job.username || 'anonymous') + '</td>';
                         html += '<td>' + (job.file_size_mb || 0) + ' MB</td>';
                         // 音声長
                         if (job.duration_sec > 0) {
@@ -795,20 +889,49 @@
 
         setInterval(refreshStatus, 5000);
 
+        // タイムスタンプをクリック可能にする
+        function formatPreviewWithTimestamps(text, jobId) {
+            return text.replace(/\[(\d{2}:\d{2}:\d{2}) --> \d{2}:\d{2}:\d{2}\]/g, function(match, startTime) {
+                var parts = startTime.split(':');
+                var seconds = parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseInt(parts[2]);
+                return '<span class="timestamp-link" onclick="seekAudio(' + seconds + ')">' + escapeHtml(match) + '</span>';
+            });
+        }
+
+        function seekAudio(seconds) {
+            var audio = document.getElementById('preview-audio');
+            audio.currentTime = seconds;
+            audio.play();
+        }
+
         // プレビューモーダル
         function openPreview(jobId) {
             fetch('/preview/' + jobId)
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
                     document.getElementById('preview-title').textContent = data.filename;
-                    document.getElementById('preview-content').textContent = data.text;
+                    document.getElementById('preview-content').innerHTML = formatPreviewWithTimestamps(data.text, data.job_id);
+                    document.getElementById('preview-audio').src = '/audio/' + data.job_id;
+                    document.getElementById('preview-save').classList.add('hidden-element');
+                    document.getElementById('preview-content').classList.remove('editing');
+                    currentPreviewJobId = data.job_id;
                     document.getElementById('preview-modal').classList.remove('hidden-element');
                 })
                 .catch(function() { alert('プレビューの取得に失敗しました'); });
         }
 
+        // モーダルを閉じる（audio停止含む）
+        function closePreviewModal() {
+            var audio = document.getElementById('preview-audio');
+            audio.pause();
+            audio.src = '';
+            document.getElementById('preview-modal').classList.add('hidden-element');
+        }
+
+        // コピーボタン（innerTextでHTMLタグ除外）
         document.getElementById('preview-copy').addEventListener('click', function() {
-            var text = document.getElementById('preview-content').textContent;
+            var el = document.getElementById('preview-content');
+            var text = el.innerText || el.textContent;
             navigator.clipboard.writeText(text).then(function() {
                 var btn = document.getElementById('preview-copy');
                 btn.textContent = 'コピー済み';
@@ -822,12 +945,54 @@
             });
         });
 
-        document.getElementById('preview-close').addEventListener('click', function() {
-            document.getElementById('preview-modal').classList.add('hidden-element');
+        // 編集検出 - contentが変更されたらSaveボタンを表示
+        document.getElementById('preview-content').addEventListener('input', function() {
+            document.getElementById('preview-save').classList.remove('hidden-element');
+            this.classList.add('editing');
         });
 
+        // 保存ボタン
+        document.getElementById('preview-save').addEventListener('click', function() {
+            if (!currentPreviewJobId) return;
+            var el = document.getElementById('preview-content');
+            var text = el.innerText || el.textContent;
+            var btn = this;
+            btn.disabled = true;
+            btn.textContent = 'Saving...';
+
+            fetch('/save/' + currentPreviewJobId, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({text: text})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.status === 'ok') {
+                    btn.textContent = 'Saved!';
+                    btn.classList.add('saved');
+                    setTimeout(function() {
+                        btn.textContent = '保存';
+                        btn.classList.remove('saved');
+                        btn.classList.add('hidden-element');
+                        el.classList.remove('editing');
+                    }, 1500);
+                } else {
+                    alert('Save failed');
+                    btn.textContent = '保存';
+                }
+                btn.disabled = false;
+            })
+            .catch(function() {
+                alert('Save failed');
+                btn.textContent = '保存';
+                btn.disabled = false;
+            });
+        });
+
+        document.getElementById('preview-close').addEventListener('click', closePreviewModal);
+
         document.getElementById('preview-modal').addEventListener('click', function(e) {
-            if (e.target === this) this.classList.add('hidden-element');
+            if (e.target === this) closePreviewModal();
         });
     </script>
 </body>
