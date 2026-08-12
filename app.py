@@ -1,6 +1,8 @@
 """KoeLog - 会議録音 文字起こしツール"""
 
 import os
+import io
+import csv
 import uuid
 import threading
 import subprocess
@@ -10,7 +12,7 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from faster_whisper import WhisperModel
@@ -583,3 +585,57 @@ async def admin_dictionary_save(request: Request):
     valid = [e for e in entries if e.get("from") and e.get("to")]
     save_dictionary(valid)
     return JSONResponse(content={"status": "ok", "count": len(valid)})
+
+
+@app.get("/admin/dictionary/export")
+async def admin_dictionary_export():
+    """Export dictionary as CSV (UTF-8 BOM for Excel)"""
+    entries = load_dictionary()
+    buf = io.StringIO()
+    buf.write("\ufeff")  # BOM for Excel
+    writer = csv.writer(buf)
+    writer.writerow(["from", "to"])
+    for e in entries:
+        if e.get("from") and e.get("to"):
+            writer.writerow([e["from"], e["to"]])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=koelog_dictionary.csv"},
+    )
+
+
+@app.post("/admin/dictionary/import")
+async def admin_dictionary_import(file: UploadFile = File(...)):
+    """Import dictionary from CSV (merge: skip duplicates)"""
+    content = await file.read()
+    # Handle BOM
+    text = content.decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(text))
+    header = next(reader, None)
+    if not header or len(header) < 2:
+        return JSONResponse(content={"status": "error", "message": "Invalid CSV format"})
+
+    imported = []
+    for row in reader:
+        if len(row) >= 2 and row[0].strip() and row[1].strip():
+            imported.append({"from": row[0].strip(), "to": row[1].strip()})
+
+    existing = load_dictionary()
+    existing_set = {(e["from"], e["to"]) for e in existing if e.get("from") and e.get("to")}
+
+    added = 0
+    for entry in imported:
+        if (entry["from"], entry["to"]) not in existing_set:
+            existing.append(entry)
+            existing_set.add((entry["from"], entry["to"]))
+            added += 1
+
+    save_dictionary(existing)
+    return JSONResponse(content={
+        "status": "ok",
+        "added": added,
+        "skipped": len(imported) - added,
+        "total": len(existing),
+    })
