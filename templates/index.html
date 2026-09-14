@@ -110,6 +110,81 @@
             min-height: 20px;
         }
 
+        /* --- 選択ファイル一覧（送信前） --- */
+        .file-list {
+            list-style: none;
+            margin-top: 12px;
+        }
+
+        .file-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+            padding: 8px 12px;
+            border: 1px solid #2a2a4a;
+            border-radius: 8px;
+            background: #16162b;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+
+        .file-item-name {
+            flex: 1 1 200px;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: #e0e0e0;
+        }
+
+        .file-item-meta {
+            color: #8888aa;
+            white-space: nowrap;
+        }
+
+        .file-item-state {
+            color: #7c8cf8;
+            white-space: nowrap;
+            min-width: 60px;
+        }
+
+        .file-item-state.is-error {
+            color: #ff6e6e;
+        }
+
+        .file-item-state.is-done {
+            color: #6ee0a8;
+        }
+
+        .btn-remove {
+            background: #3a3a5e;
+            color: #c0c0e0;
+            padding: 4px 10px;
+            font-size: 12px;
+        }
+
+        .btn-remove:hover {
+            background: #4a4a6e;
+        }
+
+        .file-summary {
+            font-size: 13px;
+            color: #8888aa;
+            margin-top: 4px;
+        }
+
+        .btn-cancel {
+            background: #6e5a1e;
+            color: #ffd27a;
+            padding: 6px 14px;
+            font-size: 13px;
+        }
+
+        .btn-cancel:hover {
+            background: #5a4a18;
+        }
+
         .upload-actions {
             margin-top: 16px;
             display: flex;
@@ -561,12 +636,13 @@
                 </div>
                 <div id="dropzone" class="dropzone">
                     <div class="dropzone-icon">&#127908;</div>
-                    <div class="dropzone-text">ファイルをドラッグ&ドロップ、またはクリックして選択</div>
-                    <div class="dropzone-sub">対応形式: {{ allowed_extensions }} / 最大 {{ max_file_size_mb }}MB</div>
-                    <input type="file" name="file" id="file-input" class="file-input-hidden"
+                    <div class="dropzone-text">ファイルをドラッグ&ドロップ、またはクリックして選択（複数可）</div>
+                    <div class="dropzone-sub">対応形式: {{ allowed_extensions }} / 最大 {{ max_file_size_mb }}MB / 追加した順にキューで処理します</div>
+                    <input type="file" name="file" id="file-input" class="file-input-hidden" multiple
                            accept=".mp3,.wav,.m4a,.ogg,.flac,.webm">
                 </div>
-                <div id="selected-file" class="selected-file"></div>
+                <ul id="file-list" class="file-list"></ul>
+                <div id="file-summary" class="file-summary"></div>
                 <div class="email-input-area">
                     <label for="email-input" class="email-label">通知先メールアドレス（任意）</label>
                     <input type="email" name="email" id="email-input" class="email-input" placeholder="example@company.com">
@@ -596,7 +672,8 @@
                     <input type="text" name="custom_prompt" id="custom-prompt" class="email-input" placeholder="認識精度を上げたい用語をカンマ区切りで入力">
                 </div>
                 <div class="upload-actions">
-                    <button type="submit" id="upload-btn" class="btn btn-primary" disabled>文字起こし開始</button>
+                    <button type="submit" id="upload-btn" class="btn btn-primary" disabled>まとめて送信</button>
+                    <button type="button" id="clear-btn" class="btn btn-remove hidden-element">選択をクリア</button>
                 </div>
                 <div id="upload-progress" class="upload-progress hidden-element">
                     <div class="upload-progress-bar-container">
@@ -604,6 +681,7 @@
                     </div>
                     <span id="upload-progress-text" class="upload-progress-text">0%</span>
                 </div>
+                <div id="upload-progress-label" class="file-summary"></div>
             </form>
         </section>
 
@@ -639,7 +717,7 @@
                                 </td>
                                 <td>
                                     {% if job.status == "waiting" %}
-                                        <span class="status-badge status-waiting">待機中</span>
+                                        <span class="status-badge status-waiting">待機 {{ job.queue_position }} 番目</span>
                                         {% if job.estimated_sec > 0 %}
                                         <div class="elapsed-text">推定 {{ (job.estimated_sec // 60)|int }}分{{ (job.estimated_sec % 60)|int }}秒</div>
                                         {% endif %}
@@ -661,7 +739,9 @@
                                         <button onclick="openPreview('{{ job.job_id }}')" class="btn btn-preview">プレビュー</button>
                                         <a href="/download/{{ job.job_id }}" class="btn btn-download">ダウンロード</a>
                                         {% endif %}
-                                        {% if job.status != "processing" %}
+                                        {% if job.status == "waiting" %}
+                                        <button type="button" onclick="cancelJob('{{ job.job_id }}')" class="btn btn-cancel">取消</button>
+                                        {% elif job.status != "processing" %}
                                         <form action="/delete/{{ job.job_id }}" method="post" class="delete-form"
                                               onsubmit="return confirm('このジョブを削除しますか？');">
                                             <button type="submit" class="btn btn-danger">削除</button>
@@ -702,9 +782,17 @@
     <script>
         var dropzone = document.getElementById('dropzone');
         var fileInput = document.getElementById('file-input');
-        var selectedFile = document.getElementById('selected-file');
+        var fileListEl = document.getElementById('file-list');
+        var fileSummaryEl = document.getElementById('file-summary');
         var uploadBtn = document.getElementById('upload-btn');
+        var clearBtn = document.getElementById('clear-btn');
         var currentPreviewJobId = null;
+
+        // 送信待ちファイル（追加した順。送信中に追加しても末尾に入る）
+        var pendingFiles = [];
+        var isUploading = false;
+        var MAX_FILE_SIZE_MB = {{ max_file_size_mb }};
+        var ALLOWED_EXT = ['.mp3', '.wav', '.m4a', '.ogg', '.flac', '.webm'];
 
         // ユーザー名をlocalStorageから復元
         var usernameInput = document.getElementById('username-input');
@@ -739,39 +827,147 @@
         dropzone.addEventListener('drop', function(e) {
             e.preventDefault();
             dropzone.classList.remove('dragover');
-            fileInput.files = e.dataTransfer.files;
-            onFileSelected();
+            addFiles(e.dataTransfer.files);
         });
 
-        // ファイル選択時
+        // ファイル選択時（複数可・追加選択で末尾に積む）
         fileInput.addEventListener('change', function() {
-            onFileSelected();
+            addFiles(fileInput.files);
+            fileInput.value = '';
         });
 
-        function onFileSelected() {
-            if (fileInput.files.length > 0) {
-                var file = fileInput.files[0];
-                var sizeMB = (file.size / (1024 * 1024)).toFixed(1);
-                selectedFile.textContent = file.name + ' (' + sizeMB + ' MB)';
-                uploadBtn.disabled = false;
-            } else {
-                selectedFile.textContent = '';
-                uploadBtn.disabled = true;
+        function formatSeconds(sec) {
+            var m = Math.floor(sec / 60);
+            var s = Math.floor(sec % 60);
+            return m + '分' + s + '秒';
+        }
+
+        function addFiles(fileList) {
+            for (var i = 0; i < fileList.length; i++) {
+                var f = fileList[i];
+                var ext = (f.name.lastIndexOf('.') >= 0 ? f.name.substring(f.name.lastIndexOf('.')) : '').toLowerCase();
+                var item = { file: f, name: f.name, sizeMB: f.size / (1024 * 1024), duration: null, state: 'pending', message: '' };
+                if (ALLOWED_EXT.indexOf(ext) < 0) {
+                    item.state = 'error';
+                    item.message = '非対応形式';
+                } else if (item.sizeMB > MAX_FILE_SIZE_MB) {
+                    item.state = 'error';
+                    item.message = 'サイズ超過';
+                }
+                pendingFiles.push(item);
+                if (item.state === 'pending') probeDuration(item);
+            }
+            renderFileList();
+            // 送信中に追加した分は、進行中の送信ループが順番に拾う（finishOne → nextPendingIndex）
+        }
+
+        // ブラウザで音声長を取得して推定処理時間（音声長×1.0）を出す
+        function probeDuration(item) {
+            try {
+                var url = URL.createObjectURL(item.file);
+                var audio = new Audio();
+                audio.preload = 'metadata';
+                audio.onloadedmetadata = function() {
+                    if (isFinite(audio.duration)) item.duration = audio.duration;
+                    URL.revokeObjectURL(url);
+                    renderFileList();
+                };
+                audio.onerror = function() {
+                    URL.revokeObjectURL(url);
+                };
+                audio.src = url;
+            } catch (e) {
+                // 推定不可のときは「-」表示のまま
             }
         }
 
-        // アップロード（fetchでプログレス付き）
-        document.getElementById('upload-form').addEventListener('submit', function(e) {
-            e.preventDefault();
-            localStorage.setItem('koelog_username', document.getElementById('username-input').value.trim());
-            var formData = new FormData(this);
-            uploadBtn.disabled = true;
-            uploadBtn.textContent = 'アップロード中...';
+        function removePending(index) {
+            if (index < 0 || index >= pendingFiles.length) return;
+            if (pendingFiles[index].state === 'uploading') return;
+            pendingFiles.splice(index, 1);
+            renderFileList();
+        }
+
+        function renderFileList() {
+            var html = '';
+            var pendingCount = 0;
+            for (var i = 0; i < pendingFiles.length; i++) {
+                var it = pendingFiles[i];
+                if (it.state === 'pending') pendingCount++;
+                var stateText = '';
+                var stateClass = 'file-item-state';
+                if (it.state === 'pending') stateText = '送信待ち';
+                else if (it.state === 'uploading') stateText = '送信中 ' + (it.pct || 0) + '%';
+                else if (it.state === 'done') { stateText = 'キュー投入済み'; stateClass += ' is-done'; }
+                else if (it.state === 'error') { stateText = it.message || 'エラー'; stateClass += ' is-error'; }
+                html += '<li class="file-item">';
+                html += '<span class="file-item-name" title="' + escapeHtml(it.name) + '">' + escapeHtml(it.name) + '</span>';
+                html += '<span class="file-item-meta">' + it.sizeMB.toFixed(1) + ' MB</span>';
+                html += '<span class="file-item-meta">音声長 ' + (it.duration ? formatSeconds(it.duration) : '-') + '</span>';
+                html += '<span class="file-item-meta">推定 ' + (it.duration ? formatSeconds(it.duration * 1.0) : '-') + '</span>';
+                html += '<span class="' + stateClass + '">' + escapeHtml(stateText) + '</span>';
+                if (it.state !== 'uploading') {
+                    html += '<button type="button" class="btn btn-remove" onclick="removePending(' + i + ')">外す</button>';
+                }
+                html += '</li>';
+            }
+            fileListEl.innerHTML = html;
+            if (pendingFiles.length === 0) {
+                fileSummaryEl.textContent = '';
+                clearBtn.classList.add('hidden-element');
+            } else {
+                var total = 0;
+                for (var j = 0; j < pendingFiles.length; j++) if (pendingFiles[j].state === 'pending') total += pendingFiles[j].sizeMB;
+                fileSummaryEl.textContent = '送信待ち ' + pendingCount + ' 件（合計 ' + total.toFixed(1) + ' MB）';
+                clearBtn.classList.remove('hidden-element');
+            }
+            uploadBtn.disabled = (pendingCount === 0) || isUploading;
+            uploadBtn.textContent = isUploading ? '送信中...' : (pendingCount > 1 ? 'まとめて送信（' + pendingCount + '件）' : 'まとめて送信');
+        }
+
+        clearBtn.addEventListener('click', function() {
+            pendingFiles = pendingFiles.filter(function(it) { return it.state === 'uploading'; });
+            renderFileList();
+        });
+
+        function nextPendingIndex() {
+            for (var i = 0; i < pendingFiles.length; i++) {
+                if (pendingFiles[i].state === 'pending') return i;
+            }
+            return -1;
+        }
+
+        // 1件ずつ順番に POST /upload（順序を保つため直列）
+        function startUploadLoop() {
+            if (isUploading) return;
+            var idx = nextPendingIndex();
+            if (idx < 0) return;
+            isUploading = true;
+            renderFileList();
+            uploadOne(idx);
+        }
+
+        function uploadOne(idx) {
+            var item = pendingFiles[idx];
+            item.state = 'uploading';
+            item.pct = 0;
+            renderFileList();
+
+            var form = document.getElementById('upload-form');
+            var formData = new FormData();
+            formData.append('file', item.file, item.name);
+            formData.append('username', form.username.value);
+            formData.append('email', form.email.value);
+            formData.append('output_format', form.output_format.value);
+            formData.append('field', form.field.value);
+            formData.append('custom_prompt', form.custom_prompt.value);
 
             var progressContainer = document.getElementById('upload-progress');
             var progressBar = document.getElementById('upload-progress-bar');
             var progressText = document.getElementById('upload-progress-text');
+            var progressLabel = document.getElementById('upload-progress-label');
             progressContainer.classList.remove('hidden-element');
+            progressLabel.textContent = '送信中: ' + item.name;
 
             var xhr = new XMLHttpRequest();
             xhr.open('POST', '/upload', true);
@@ -779,30 +975,69 @@
             xhr.upload.addEventListener('progress', function(e) {
                 if (e.lengthComputable) {
                     var pct = Math.round((e.loaded / e.total) * 100);
+                    item.pct = pct;
                     progressBar.style.width = pct + '%';
                     progressText.textContent = pct + '%';
+                    renderFileList();
                 }
             });
 
-            xhr.onload = function() {
-                progressContainer.classList.add('hidden-element');
+            function finishOne() {
                 progressBar.style.width = '0%';
-                uploadBtn.textContent = '文字起こし開始';
-                uploadBtn.disabled = true;
-                selectedFile.textContent = '';
-                fileInput.value = '';
+                progressText.textContent = '0%';
                 refreshStatus();
+                var next = nextPendingIndex();
+                if (next >= 0) {
+                    uploadOne(next);
+                } else {
+                    isUploading = false;
+                    progressContainer.classList.add('hidden-element');
+                    progressLabel.textContent = '';
+                    // 投入済みの行は一覧から消す（エラーは残す）
+                    pendingFiles = pendingFiles.filter(function(it) { return it.state !== 'done'; });
+                    renderFileList();
+                }
+            }
+
+            xhr.onload = function() {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    item.state = 'done';
+                } else {
+                    item.state = 'error';
+                    var msg = 'アップロード失敗 (' + xhr.status + ')';
+                    try { msg = JSON.parse(xhr.responseText).detail || msg; } catch (e) {}
+                    item.message = msg;
+                }
+                finishOne();
             };
 
             xhr.onerror = function() {
-                progressContainer.classList.add('hidden-element');
-                alert('アップロードに失敗しました');
-                uploadBtn.textContent = '文字起こし開始';
-                uploadBtn.disabled = false;
+                item.state = 'error';
+                item.message = '通信エラー';
+                finishOne();
             };
 
             xhr.send(formData);
+        }
+
+        // 「まとめて送信」
+        document.getElementById('upload-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            localStorage.setItem('koelog_username', document.getElementById('username-input').value.trim());
+            startUploadLoop();
         });
+
+        // 待機中ジョブの取消（キューから外す）
+        function cancelJob(jobId) {
+            if (!confirm('このジョブを取り消しますか？')) return;
+            fetch('/cancel/' + jobId, { method: 'POST' })
+                .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+                .then(function(res) {
+                    if (!res.ok) alert(res.data.detail || '取消に失敗しました');
+                    refreshStatus();
+                })
+                .catch(function() { alert('取消に失敗しました'); });
+        }
 
         // ジョブ一覧の自動更新
         var statusLabels = {
@@ -842,7 +1077,11 @@
                         } else {
                             html += '<td>-</td>';
                         }
-                        html += '<td>' + statusLabels[job.status];
+                        if (job.status === 'waiting') {
+                            html += '<td><span class="status-badge status-waiting">待機 ' + (job.queue_position || '-') + ' 番目</span>';
+                        } else {
+                            html += '<td>' + (statusLabels[job.status] || escapeHtml(job.status));
+                        }
                         if (job.status === 'failed' && job.error) {
                             html += '<div class="error-text">' + escapeHtml(job.error) + '</div>';
                         }
@@ -851,8 +1090,8 @@
                             var estSec = Math.floor(job.estimated_sec % 60);
                             html += '<div class="elapsed-text">推定 ' + estMin + '分' + estSec + '秒</div>';
                         }
-                        if (job.status === 'processing' && job.created_at) {
-                            var elapsed = Math.floor((Date.now() - new Date(job.created_at.replace(' ', 'T')).getTime()) / 1000);
+                        if (job.status === 'processing' && (job.started_at || job.created_at)) {
+                            var elapsed = Math.floor((Date.now() - new Date((job.started_at || job.created_at).replace(' ', 'T')).getTime()) / 1000);
                             var min = Math.floor(elapsed / 60);
                             var sec = elapsed % 60;
                             html += '<div class="elapsed-text">' + min + '分' + sec + '秒経過</div>';
@@ -872,7 +1111,9 @@
                             html += '<button onclick="openPreview(\'' + job.job_id + '\')" class="btn btn-preview">プレビュー</button>';
                             html += '<a href="/download/' + job.job_id + '" class="btn btn-download">ダウンロード</a>';
                         }
-                        if (job.status !== 'processing') {
+                        if (job.status === 'waiting') {
+                            html += '<button type="button" onclick="cancelJob(\'' + job.job_id + '\')" class="btn btn-cancel">取消</button>';
+                        } else if (job.status !== 'processing') {
                             html += '<form action="/delete/' + job.job_id + '" method="post" class="delete-form" onsubmit="return confirm(\'このジョブを削除しますか？\');">';
                             html += '<button type="submit" class="btn btn-danger">削除</button>';
                             html += '</form>';

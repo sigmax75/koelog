@@ -7,6 +7,7 @@ DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
 LANGUAGE = "ja"
 MAX_FILE_SIZE_MB = 500
+WORKER_COUNT = 1        # 同時に文字起こしするジョブ数（CPU保護のため1推奨）。キューは受付順
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
 
 # --- メール通知 ---
