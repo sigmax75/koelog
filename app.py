@@ -3,6 +3,7 @@
 import os
 import io
 import csv
+import gc
 import time
 import uuid
 import queue
@@ -20,6 +21,7 @@ from fastapi.templating import Jinja2Templates
 import json
 
 import config
+import presets
 
 # --- 検証用モック（KOELOG_MOCK=1 のときだけ faster-whisper を使わない） ---
 MOCK_MODE = os.environ.get("KOELOG_MOCK") == "1"
@@ -44,6 +46,10 @@ def load_settings():
         # 保存先（空欄なら config.UPLOAD_DIR / config.RESULT_DIR）
         "upload_dir": "",
         "result_dir": "",
+        # 精度と時間のバランス（既定の段階）
+        "default_quality_level": presets.DEFAULT_LEVEL,
+        # 段階ごとの実測倍率（このサーバーでの実績。推定処理時間の精度を上げる）
+        "quality_stats": {},
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -94,6 +100,32 @@ def get_upload_dir() -> str:
     if not p or not ok:
         p = config.UPLOAD_DIR
     return os.path.abspath(p)
+
+
+def get_default_quality_level() -> str:
+    """管理画面で設定された既定の段階（不正値は presets 側で既定に落ちる）"""
+    return presets.normalize_level(load_settings().get("default_quality_level"))
+
+
+def get_quality_stats() -> dict:
+    """段階ごとの所要時間の実績（このサーバーでの実測倍率）"""
+    s = load_settings().get("quality_stats")
+    return s if isinstance(s, dict) else {}
+
+
+def record_quality_stat(level: str, duration_sec: float, elapsed_sec: float):
+    """1本終わるごとに倍率の実績を更新する。
+
+    組み込みの見込みは検証用PCからの換算なので、実機では必ずずれる。
+    実績がたまったら推定処理時間の表示をそちらに切り替える。
+    モック時は実時間に意味がないので呼ばない。
+    """
+    try:
+        stats = presets.update_stats(get_quality_stats(), level, duration_sec, elapsed_sec)
+        update_settings({"quality_stats": stats})
+    except Exception as e:
+        # 統計の更新に失敗してもジョブ自体は成功扱いのままにする
+        print(f"[KoeLog] 所要時間の実績の記録に失敗しました: {e}")
 
 
 def get_result_dir() -> str:
@@ -171,14 +203,138 @@ def apply_dictionary(text):
 os.makedirs(config.UPLOAD_DIR, exist_ok=True)
 os.makedirs(config.RESULT_DIR, exist_ok=True)
 
-# --- モデルロード（起動時に1回だけ） ---
+# --- モデルロード ---
+# 段階ごとにモデルが違うので、使うときに読み込んで保持する。
+# 既定では1個だけ保持する（16GBのサーバーで medium と large-v3 を
+# 同時に抱えるとメモリが足りなくなるため）。
+MODEL_CACHE_SIZE = max(1, int(getattr(config, "MODEL_CACHE_SIZE", 1)))
+_model_cache: "dict[tuple, object]" = {}
+
+# ロックは2本に分ける。
+#   _cache_lock : キャッシュ辞書を触るあいだだけ握る「短いロック」。
+#                 状態の読み取り（管理画面）もこちらしか使わない。
+#   _load_lock  : 実際にモデルを構築するあいだ握る「長いロック」。
+#                 大きいモデルを2つ同時に読み込んでメモリを倍使わないため。
+# 1本にまとめると、読み込み（初回は約3.1GBのダウンロード）のあいだ
+# 管理画面の「モデルの状態を再確認」が返らなくなる。
+# 実測では読み込み20秒のうち19.1秒待たされていた。
+_cache_lock = threading.Lock()
+_load_lock = threading.Lock()
+# 読み込み中のキー -> 完了を知らせるイベント。
+# 同じモデルを複数のスレッドが同時に要求しても、読み込むのは1回だけにする。
+_loading: "dict[tuple, threading.Event]" = {}
+
+
+def _evict_for_new_model():
+    """新しいモデルを読む前に、保持数を下回るまで古いものを捨てる。
+
+    読み込みの**前**に捨てる（後ではない）。後に捨てると、入れ替えの瞬間だけ
+    2個ぶんのメモリを使う。16GB のサーバーで medium と large-v3 が
+    重なると苦しいので、ピークを増やさない。
+    """
+    with _cache_lock:
+        while len(_model_cache) >= MODEL_CACHE_SIZE:
+            old = next(iter(_model_cache))
+            print(f"[KoeLog] モデルを解放します: {old}")
+            del _model_cache[old]
+            gc.collect()
+
+
+def get_model(model_size: str, compute_type: str, cpu_threads: int = 0):
+    """指定の構成のモデルを返す。未読込なら読み込む（初回はダウンロードが走る）"""
+    key = (model_size, compute_type, int(cpu_threads or 0))
+    while True:
+        with _cache_lock:
+            if key in _model_cache:
+                return _model_cache[key]
+            ev = _loading.get(key)
+            if ev is None:
+                # 自分が読み込む係になる
+                ev = threading.Event()
+                _loading[key] = ev
+                leader = True
+            else:
+                leader = False
+        if leader:
+            break
+        # 別のスレッドが同じモデルを読み込み中。終わるのを待つ（ロックは握らない）
+        ev.wait()
+        # 読み込めていればキャッシュから取れる。失敗していたら自分が係になってやり直す
+
+    try:
+        # 「退避 → 構築 → 挿入」を _load_lock の中でひとまとまりにする。
+        #
+        # 退避や挿入をこの外に出すと、別モデルの係が「相手が挿入する前」に
+        # 退避してしまい、捨てるものが無いまま自分のぶんを足すので
+        # 保持数が MODEL_CACHE_SIZE を超える。
+        # 実測（Barrier で4本同時・差し替えた置物）: 外に出していたときは
+        # 4個とも残った（['base','large-v3','medium','small']）。
+        #
+        # ロックの順序は必ず _load_lock → _cache_lock。逆順で取る場所を
+        # 作らないこと（作るとデッドロックする）。
+        # 退避は構築の**前**のままなので、メモリのピークは増えない。
+        with _load_lock:
+            _evict_for_new_model()
+            print(f"[KoeLog] Whisperモデル読み込み中... "
+                  f"(size={model_size}, device={config.DEVICE}, "
+                  f"compute_type={compute_type}, cpu_threads={key[2]})")
+            t0 = time.time()
+            # 構築中は _cache_lock を握らない。握ると状態の読み取りまで止まる
+            m = WhisperModel(model_size, device=config.DEVICE,
+                             compute_type=compute_type, cpu_threads=key[2])
+            print(f"[KoeLog] モデル読み込み完了 ({time.time() - t0:.1f}秒)")
+            with _cache_lock:
+                _model_cache[key] = m
+        return m
+    finally:
+        with _cache_lock:
+            _loading.pop(key, None)
+        ev.set()
+
+
+def loaded_model_keys():
+    """いま読み込まれているモデル構成（管理画面の表示用）。
+
+    読み込み中でも即座に返す（短いロックしか取らない）。
+    """
+    with _cache_lock:
+        keys = list(_model_cache)
+    return [{"model_size": k[0], "compute_type": k[1], "cpu_threads": k[2]}
+            for k in keys]
+
+
+def loading_model_keys():
+    """いま読み込み中のモデル構成（管理画面の表示用）"""
+    with _cache_lock:
+        keys = list(_loading)
+    return [{"model_size": k[0], "compute_type": k[1], "cpu_threads": k[2]}
+            for k in keys]
+
+
+def _warm_default_model():
+    """既定段階のモデルを裏で先読みする（起動を待たせない）"""
+    p = presets.get(get_default_quality_level())
+    try:
+        get_model(p["model_size"], p["compute_type"], p.get("cpu_threads", 0))
+    except Exception as e:
+        # ここで落としても起動は続ける。ジョブ実行時に読み直す
+        print(f"[KoeLog] 起動時のモデル先読みに失敗しました（ジョブ実行時に再試行します）: {e}")
+
+
 if MOCK_MODE:
     print("[KoeLog] KOELOG_MOCK=1: Whisperモデルは読み込みません（検証用ダミー処理）")
-    model = None
 else:
-    print(f"[KoeLog] Whisperモデル読み込み中... (size={config.MODEL_SIZE}, device={config.DEVICE}, compute_type={config.COMPUTE_TYPE})")
-    model = WhisperModel(config.MODEL_SIZE, device=config.DEVICE, compute_type=config.COMPUTE_TYPE)
-    print("[KoeLog] モデル読み込み完了")
+    # 既定段階のモデルを**別スレッドで**先読みする。
+    #
+    # ここで同期的に読むと、import が終わるまで uvicorn が listen できず、
+    # 読み込みの間ずっと「サーバーが無応答」に見える。
+    # 段階5(large-v3)を既定にすると、未取得なら約3.1GBのダウンロードぶん、
+    # 取得済みでも読み込みぶん（検証PCで149秒）が丸ごと無応答時間になっていた。
+    # 先に listen し、モデルは裏で用意する。
+    # 用意できる前にジョブが来ても、get_model が同じロックで待つので二重には読まない。
+    threading.Thread(target=_warm_default_model, daemon=True,
+                     name="koelog-model-warmup").start()
+    print("[KoeLog] 既定段階のモデルを裏で読み込み中です（画面はすぐ使えます）")
 
 # --- FastAPI ---
 app = FastAPI(title="KoeLog")
@@ -223,6 +379,15 @@ def build_job_view(job: dict, position_map: dict) -> dict:
         "duration_sec": job.get("duration_sec", 0),
         "estimated_sec": job.get("estimated_sec", 0),
         "username": job.get("username", "anonymous"),
+        "quality_level": job.get("quality_level", presets.DEFAULT_LEVEL),
+        "quality_name": presets.get(job.get("quality_level"))["name"],
+        # 処理中の内訳。モデルの用意（初回はダウンロード）は時間がかかるので区別する
+        "phase": job.get("phase", ""),
+        # 実際にかかった時間の内訳。モデルの用意は音声の長さに比例しない固定費なので
+        # 分けて持つ（実績の倍率は transcribe_sec のほうで計算している）
+        "elapsed_sec": job.get("elapsed_sec", 0),
+        "model_load_sec": job.get("model_load_sec", 0),
+        "transcribe_sec": job.get("transcribe_sec", 0),
     }
 
 
@@ -382,9 +547,16 @@ def run_transcription(job: dict, filepath: str):
     if MOCK_MODE:
         # 検証用: 数秒待ってダミー結果を返す（faster-whisper / ffmpeg 不要）
         time.sleep(float(os.environ.get("KOELOG_MOCK_SLEEP", "3")))
+        lv = presets.normalize_level(job.get("quality_level"))
+        p = presets.get(lv)
         segments_data = [
             {"start": 0.0, "end": 2.5, "text": f"ダミー文字起こし: {job['filename']}"},
             {"start": 2.5, "end": 5.0, "text": "KOELOG_MOCK=1 で生成された検証用テキストです。"},
+            # どの段階で動いたかを検証できるようにする（モック時のみ）
+            {"start": 5.0, "end": 7.5,
+             "text": f"段階={lv} ({p['name']}) model={p['model_size']} "
+                     f"beam={p['transcribe'].get('beam_size')} "
+                     f"vad={p['transcribe'].get('vad_filter')}"},
         ]
         return format_result(segments_data, job.get("output_format", "timestamp"))
 
@@ -397,21 +569,29 @@ def run_transcription(job: dict, filepath: str):
     else:
         prompt = config.INITIAL_PROMPT
 
+    # 精度と時間のバランス（段階）。ジョブ受付時に確定した値を使う。
+    # 段階3 は従来の呼び出しと同じ引数になる（presets.py 参照）
+    level = presets.normalize_level(job.get("quality_level"))
+    preset = presets.get(level)
+
+    # モデルの用意にかかった時間は、音声の長さに比例しない「固定費」。
+    # 所要時間の実績（倍率）に混ぜると倍率が膨らむので、別に測って後で差し引く。
+    # 初回はここでダウンロード（large-v3 で約3.1GB）が走るため、
+    # 画面に「モデルを準備中」と出せるよう phase を立てる。
+    job["phase"] = "model"
+    _t_model = time.time()
+    try:
+        model = get_model(preset["model_size"], preset["compute_type"],
+                          preset.get("cpu_threads", 0))
+    finally:
+        job["model_load_sec"] = round(time.time() - _t_model, 1)
+        job["phase"] = "transcribe"
+
     segments, info = model.transcribe(
         filepath,  # 前処理済みファイルを使用
         language=config.LANGUAGE,
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters=dict(
-            min_silence_duration_ms=500,
-            speech_pad_ms=300,
-        ),
         initial_prompt=prompt,
-        temperature=config.TEMPERATURE,
-        condition_on_previous_text=False,
-        hallucination_silence_threshold=2.0,
-        repetition_penalty=1.1,
-        no_repeat_ngram_size=3,
+        **preset["transcribe"],
     )
 
     # セグメントデータを収集
@@ -439,6 +619,7 @@ def process_job(job_id: str):
 
     filepath = job["upload_path"]
     preprocessed_path = None
+    t_start = time.time()   # 所要時間の実測（前処理＋文字起こし）
     try:
         # ffmpeg前処理（モック時はスキップ）
         preprocessed_path = filepath if MOCK_MODE else preprocess_audio(filepath)
@@ -462,7 +643,20 @@ def process_job(job_id: str):
         job["result_path"] = result_path
         job["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         job["status"] = "completed"
-        print(f"[KoeLog] 処理完了 {job['completed_at']} job={job_id}")
+        job["elapsed_sec"] = round(time.time() - t_start, 1)
+        # モデルの用意（読み込み・初回ダウンロード）は音声の長さに比例しない固定費。
+        # 実績の倍率はこれを除いた「実際に文字起こしにかかった時間」で測る。
+        # 除かないと、初回のダウンロードが乗った1本目だけで倍率が何倍にも膨らむ。
+        model_sec = float(job.get("model_load_sec") or 0)
+        job["transcribe_sec"] = round(max(0.0, job["elapsed_sec"] - model_sec), 1)
+        print(f"[KoeLog] 処理完了 {job['completed_at']} job={job_id} "
+              f"所要={job['elapsed_sec']}秒（うちモデル準備={model_sec}秒）"
+              f" 段階={job.get('quality_level')}")
+
+        # 推定処理時間を実機に合わせていくため、実績を記録する（モックは除く）
+        if not MOCK_MODE:
+            record_quality_stat(job.get("quality_level"), job.get("duration_sec", 0),
+                                job["transcribe_sec"])
 
         # メール通知
         send_notification(job.get("email", ""), job)
@@ -507,11 +701,13 @@ async def index(request: Request):
         "jobs": job_list,
         "max_file_size_mb": config.MAX_FILE_SIZE_MB,
         "allowed_extensions": ", ".join(sorted(config.ALLOWED_EXTENSIONS)),
+        "quality_levels": presets.ui_levels(get_quality_stats()),
+        "default_quality_level": get_default_quality_level(),
     })
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), email: str = Form(""), output_format: str = Form("timestamp"), field: str = Form("general"), custom_prompt: str = Form(""), username: str = Form("")):
+async def upload(file: UploadFile = File(...), email: str = Form(""), output_format: str = Form("timestamp"), field: str = Form("general"), custom_prompt: str = Form(""), username: str = Form(""), quality_level: str = Form("")):
     """音声ファイルアップロード → ジョブ作成"""
     # 拡張子チェック
     _, ext = os.path.splitext(file.filename or "")
@@ -538,6 +734,9 @@ async def upload(file: UploadFile = File(...), email: str = Form(""), output_for
     safe_filename = f"{job_id}{ext}"
     upload_dir = get_upload_dir()
     result_dir = get_result_dir()
+    # 段階も受付時点で確定する（未指定・不正値は管理画面の既定段階）
+    level = (quality_level or "").strip()
+    level = presets.normalize_level(level) if level else get_default_quality_level()
     try:
         os.makedirs(upload_dir, exist_ok=True)
     except OSError as e:
@@ -571,7 +770,9 @@ async def upload(file: UploadFile = File(...), email: str = Form(""), output_for
             "email": email.strip(),
             "output_format": output_format,
             "duration_sec": round(duration, 1),
-            "estimated_sec": round(duration * 1.0, 0),
+            # 推定処理時間は段階ごとに変わる。このサーバーの実績があればそれを使う
+            "estimated_sec": presets.estimate_sec(duration, level, get_quality_stats()),
+            "quality_level": level,
             "field": field,
             "custom_prompt": custom_prompt.strip(),
             "username": username.strip() or "anonymous",
@@ -581,7 +782,11 @@ async def upload(file: UploadFile = File(...), email: str = Form(""), output_for
     job_queue.put(job_id)
     position = len(waiting_job_ids_in_order())
 
-    return JSONResponse(content={"job_id": job_id, "status": "ok", "queue_position": position})
+    return JSONResponse(content={
+        "job_id": job_id, "status": "ok", "queue_position": position,
+        "quality_level": level,
+        "quality_name": presets.get(level)["name"],
+    })
 
 
 @app.get("/status")
@@ -700,6 +905,60 @@ async def admin_page(request: Request):
         "settings": settings,
         "default_upload_dir": os.path.abspath(config.UPLOAD_DIR),
         "default_result_dir": os.path.abspath(config.RESULT_DIR),
+        "quality_levels": presets.ui_levels(get_quality_stats()),
+        "quality_models": presets.model_status(get_quality_stats()),
+        "default_quality_level": get_default_quality_level(),
+    })
+
+
+@app.post("/admin/quality/save")
+async def admin_quality_save(default_quality_level: str = Form("")):
+    """既定の段階を保存。次のジョブから有効（実行中・待機中のジョブは変えない）。
+
+    /admin/save（SMTP）とは別のエンドポイントにしてある。
+    /admin/save は「送られたフィールドだけ更新する」作りなので、そこには触らない。
+    """
+    raw = (default_quality_level or "").strip()
+    if raw not in presets.PRESETS:
+        return JSONResponse(content={
+            "status": "error",
+            "message": f"段階は {'/'.join(presets.LEVELS)} のいずれかを指定してください（受け取った値: {raw or '空'}）",
+        })
+    update_settings({"default_quality_level": raw})
+    p = presets.get(raw)
+    downloaded = presets.model_is_downloaded(p["model_size"])
+    msg = f"既定の段階を「{raw}: {p['name']}」にしました（次のジョブから有効）"
+    # 起動時はこのモデルを裏で読む。時間がかかる場合はここで伝える
+    if not downloaded:
+        warn = (f"このモデル（{p['model_size']}）はまだ取得していません。"
+                f"最初のジョブ、または次回の起動時に約{presets.download_gb(raw)}GB の"
+                f"ダウンロードが走り、そのぶん最初の1本が待たされます。")
+    elif p["model_size"] == "large-v3":
+        warn = (f"このモデル（{p['model_size']}）は大きいため、"
+                f"次回の起動後に使えるようになるまで数分かかることがあります"
+                f"（画面自体はすぐ開きます）。")
+    else:
+        warn = ""
+    return JSONResponse(content={
+        "status": "ok",
+        "message": msg,
+        "warning": warn,
+        "default_quality_level": raw,
+        "hour_minutes": presets.hour_minutes(raw, get_quality_stats()),
+        "model_downloaded": downloaded,
+    })
+
+
+@app.get("/admin/quality/models")
+async def admin_quality_models():
+    """段階ごとのモデル取得状況（ネットワークには出ない。ローカルのキャッシュを見るだけ）"""
+    return JSONResponse(content={
+        "status": "ok",
+        "models": presets.model_status(get_quality_stats()),
+        "loaded": loaded_model_keys(),
+        "loading": loading_model_keys(),
+        "default_quality_level": get_default_quality_level(),
+        "mock_mode": MOCK_MODE,
     })
 
 

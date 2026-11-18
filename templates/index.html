@@ -522,6 +522,38 @@
             display: block;
         }
 
+        /* 段階の選択肢は文字列が長い（「5: 最高精度… 1時間の会議でおよそ93分」）。
+           幅を指定しないと select が一番長い選択肢の幅になり、
+           390px のスマホ幅で本文がはみ出す（実測 463px）。親の幅に収める。 */
+        .quality-select {
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .quality-summary {
+            font-size: 11px;
+            color: #666688;
+            margin-top: 4px;
+            display: block;
+        }
+
+        .quality-download-note {
+            font-size: 12px;
+            color: #8a4b00;
+            background: #fff6e5;
+            border: 1px solid #ffd79a;
+            border-radius: 4px;
+            padding: 6px 8px;
+            margin-top: 6px;
+            display: block;
+            line-height: 1.5;
+        }
+
+        .quality-cell {
+            font-size: 11px;
+            color: #666688;
+        }
+
         /* --- 出力形式選択 --- */
         .format-select-area {
             margin-top: 12px;
@@ -671,6 +703,25 @@
                     <label for="custom-prompt" class="email-label">カスタムプロンプト</label>
                     <input type="text" name="custom_prompt" id="custom-prompt" class="email-input" placeholder="認識精度を上げたい用語をカンマ区切りで入力">
                 </div>
+                <div class="format-select-area">
+                    <label for="quality-select" class="email-label">精度と時間のバランス</label>
+                    <select name="quality_level" id="quality-select" class="format-select quality-select">
+                        {% for q in quality_levels %}
+                        <option value="{{ q.level }}"
+                                data-summary="{{ q.summary }}"
+                                data-hour="{{ q.hour_minutes }}"
+                                data-model="{{ q.model_size }}"
+                                data-downloaded="{{ 'yes' if q.downloaded else 'no' }}"
+                                data-dlgb="{{ q.download_gb }}"
+                                data-basis="{{ q.time_basis }}"
+                                {% if q.level == default_quality_level %}selected{% endif %}>
+                            {{ q.level }}: {{ q.name }} — 1時間の会議でおよそ{{ q.hour_minutes }}分（{{ q.time_basis }}）
+                        </option>
+                        {% endfor %}
+                    </select>
+                    <span id="quality-summary" class="quality-summary"></span>
+                    <span id="quality-download-note" class="quality-download-note hidden-element"></span>
+                </div>
                 <div class="upload-actions">
                     <button type="submit" id="upload-btn" class="btn btn-primary" disabled>まとめて送信</button>
                     <button type="button" id="clear-btn" class="btn btn-remove hidden-element">選択をクリア</button>
@@ -696,6 +747,7 @@
                             <th>ユーザー</th>
                             <th>サイズ</th>
                             <th>音声長</th>
+                            <th>段階</th>
                             <th>状態</th>
                             <th>登録日時</th>
                             <th>操作</th>
@@ -715,6 +767,7 @@
                                         -
                                     {% endif %}
                                 </td>
+                                <td class="quality-cell">{{ job.quality_level }}: {{ job.quality_name }}</td>
                                 <td>
                                     {% if job.status == "waiting" %}
                                         <span class="status-badge status-waiting">待機 {{ job.queue_position }} 番目</span>
@@ -722,7 +775,12 @@
                                         <div class="elapsed-text">推定 {{ (job.estimated_sec // 60)|int }}分{{ (job.estimated_sec % 60)|int }}秒</div>
                                         {% endif %}
                                     {% elif job.status == "processing" %}
+                                        {% if job.phase == "model" %}
+                                        <span class="status-badge status-processing">モデル準備中</span>
+                                        <div class="elapsed-text">初めて使う段階では、ここでモデルのダウンロードが走ります（数分〜数十分）</div>
+                                        {% else %}
                                         <span class="status-badge status-processing">処理中</span>
+                                        {% endif %}
                                     {% elif job.status == "completed" %}
                                         <span class="status-badge status-completed">完了</span>
                                     {% elif job.status == "failed" %}
@@ -753,7 +811,7 @@
                             {% endfor %}
                         {% else %}
                             <tr>
-                                <td colspan="7" class="empty-message">ジョブはまだありません</td>
+                                <td colspan="8" class="empty-message">ジョブはまだありません</td>
                             </tr>
                         {% endif %}
                     </tbody>
@@ -798,6 +856,48 @@
         var usernameInput = document.getElementById('username-input');
         var savedUsername = localStorage.getItem('koelog_username');
         if (savedUsername) usernameInput.value = savedUsername;
+
+        // 精度と時間のバランス（段階）
+        var qualitySelect = document.getElementById('quality-select');
+
+        // 選んだ段階の「音声長に対する倍率」。1時間あたりの分数から出す
+        function currentQualityRatio() {
+            var opt = qualitySelect.options[qualitySelect.selectedIndex];
+            if (!opt) return 1.0;
+            var hourMin = parseFloat(opt.getAttribute('data-hour'));
+            if (!isFinite(hourMin) || hourMin <= 0) return 1.0;
+            return hourMin / 60.0;
+        }
+
+        function renderQualityInfo() {
+            var opt = qualitySelect.options[qualitySelect.selectedIndex];
+            var sum = document.getElementById('quality-summary');
+            var note = document.getElementById('quality-download-note');
+            if (!opt) return;
+            var basis = opt.getAttribute('data-basis') || '';
+            var tail = '';
+            if (basis === '未実測の見込み') {
+                tail = ' ※所要時間はこのサーバーで測った値ではありません（未実測の見込み）。' +
+                       '実際に2本流すと実績に切り替わります。';
+            } else if (basis === '見込み') {
+                tail = ' ※所要時間はまだ見込みです。実際に2本流すと実績に切り替わります。';
+            }
+            sum.textContent = (opt.getAttribute('data-summary') || '') + tail;
+            if (opt.getAttribute('data-downloaded') === 'no') {
+                note.classList.remove('hidden-element');
+                note.textContent = 'この段階のモデル（' + opt.getAttribute('data-model') +
+                    '）はまだ取得していません。最初のジョブで約' + opt.getAttribute('data-dlgb') +
+                    'GB のダウンロードが先に走るため、1本目だけ余計に待たされます。' +
+                    'ダウンロード中は一覧に「モデル準備中」と出ます。';
+            } else {
+                note.classList.add('hidden-element');
+                note.textContent = '';
+            }
+            renderFileList();
+        }
+
+        qualitySelect.addEventListener('change', renderQualityInfo);
+        renderQualityInfo();   // 初期表示（既定段階の説明とダウンロード注意を出す）
 
         // 分野選択でカスタムプロンプト表示切替
         document.getElementById('field-select').addEventListener('change', function() {
@@ -904,7 +1004,7 @@
                 html += '<span class="file-item-name" title="' + escapeHtml(it.name) + '">' + escapeHtml(it.name) + '</span>';
                 html += '<span class="file-item-meta">' + it.sizeMB.toFixed(1) + ' MB</span>';
                 html += '<span class="file-item-meta">音声長 ' + (it.duration ? formatSeconds(it.duration) : '-') + '</span>';
-                html += '<span class="file-item-meta">推定 ' + (it.duration ? formatSeconds(it.duration * 1.0) : '-') + '</span>';
+                html += '<span class="file-item-meta">推定 ' + (it.duration ? formatSeconds(it.duration * currentQualityRatio()) : '-') + '</span>';
                 html += '<span class="' + stateClass + '">' + escapeHtml(stateText) + '</span>';
                 if (it.state !== 'uploading') {
                     html += '<button type="button" class="btn btn-remove" onclick="removePending(' + i + ')">外す</button>';
@@ -961,6 +1061,9 @@
             formData.append('output_format', form.output_format.value);
             formData.append('field', form.field.value);
             formData.append('custom_prompt', form.custom_prompt.value);
+            // 画面で選んだ段階。これを送り忘れると、選んでも管理画面の既定段階で
+            // 処理されてしまう（画面上は選べているように見えるので気づきにくい）
+            formData.append('quality_level', form.quality_level.value);
 
             var progressContainer = document.getElementById('upload-progress');
             var progressBar = document.getElementById('upload-progress-bar');
@@ -1059,7 +1162,7 @@
                 .then(function(data) {
                     var tbody = document.getElementById('jobs-tbody');
                     if (data.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="7" class="empty-message">ジョブはまだありません</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="8" class="empty-message">ジョブはまだありません</td></tr>';
                         return;
                     }
                     var html = '';
@@ -1077,8 +1180,17 @@
                         } else {
                             html += '<td>-</td>';
                         }
+                        // 段階（精度と時間のバランス）
+                        html += '<td class="quality-cell">' +
+                                escapeHtml((job.quality_level || '') + ': ' + (job.quality_name || '')) +
+                                '</td>';
                         if (job.status === 'waiting') {
                             html += '<td><span class="status-badge status-waiting">待機 ' + (job.queue_position || '-') + ' 番目</span>';
+                        } else if (job.status === 'processing' && job.phase === 'model') {
+                            // モデルの用意中（初回はダウンロード）。「処理中」とだけ出すと
+                            // 何十分も進まない理由が利用者に分からない
+                            html += '<td><span class="status-badge status-processing">モデル準備中</span>';
+                            html += '<div class="elapsed-text">初めて使う段階では、ここでモデルのダウンロードが走ります（数分〜数十分）</div>';
                         } else {
                             html += '<td>' + (statusLabels[job.status] || escapeHtml(job.status));
                         }

@@ -81,6 +81,19 @@
         .storage-ok { background: #1e4e3a; color: #6ee0a8; }
         .storage-missing { background: #5a4a18; color: #ffd27a; }
         .storage-error { background: #4e1e1e; color: #ff6e6e; }
+        .quality-table-wrapper { overflow-x: auto; margin-top: 16px; }
+        .quality-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        .quality-table th, .quality-table td {
+            padding: 8px 10px; text-align: left; border-bottom: 1px solid #343456;
+            white-space: nowrap;
+        }
+        .quality-table th { color: #a0a0c8; font-weight: 500; }
+        .quality-table td { color: #d0d0e8; }
+        .model-ready { color: #6ee0a8; }
+        .model-missing { color: #ffd27a; white-space: normal; }
+        .ratio-learned { color: #6ee0a8; }
+        .ratio-estimate { color: #a0a0c8; }
+        .ratio-unmeasured { color: #ffd27a; }
 
         @media (max-width: 768px) {
             header { padding: 24px 5%; }
@@ -186,6 +199,76 @@
             <div id="storage-test-result" class="storage-result hidden-element"></div>
             <div id="storage-message" class="hidden-element"></div>
         </form>
+
+        <hr class="divider">
+
+        <h2 class="section-title">精度と時間のバランス（既定の段階）</h2>
+        <p class="form-hint-block">アップロード画面で段階を選ばなかったときに使う段階です。変更は次のジョブから有効です（処理中・待機中のジョブには影響しません）。利用者はアップロードのたびに段階を変えられます。</p>
+
+        <form id="quality-form">
+            <div class="form-group">
+                <label class="form-label" for="quality-default">既定の段階</label>
+                <select id="quality-default" name="default_quality_level" class="form-input">
+                    {% for q in quality_levels %}
+                    <option value="{{ q.level }}" {% if q.level == default_quality_level %}selected{% endif %}>
+                        {{ q.level }}: {{ q.name }} — 1時間の会議でおよそ{{ q.hour_minutes }}分
+                    </option>
+                    {% endfor %}
+                </select>
+                <span class="form-hint">段階3 がこれまでの KoeLog と同じ設定です。</span>
+            </div>
+
+            <div class="actions-row">
+                <button type="submit" class="btn btn-primary">既定の段階を保存</button>
+                <button type="button" id="quality-refresh-btn" class="btn btn-secondary">モデルの状態を再確認</button>
+            </div>
+            <div id="quality-message" class="hidden-element"></div>
+        </form>
+
+        <div class="quality-table-wrapper">
+            <table class="quality-table" id="quality-models-table">
+                <thead>
+                    <tr>
+                        <th>段階</th>
+                        <th>名前</th>
+                        <th>モデル</th>
+                        <th>1時間の会議</th>
+                        <th>時間の根拠</th>
+                        <th>メモリ目安</th>
+                        <th>モデルの取得</th>
+                    </tr>
+                </thead>
+                <tbody id="quality-models-tbody">
+                    {% for m in quality_models %}
+                    <tr>
+                        <td>{{ m.level }}</td>
+                        <td>{{ m.name }}</td>
+                        <td>{{ m.model_size }}</td>
+                        <td>およそ{{ m.hour_minutes }}分</td>
+                        <td>
+                            {% if m.learned %}
+                            <span class="ratio-learned">{{ m.time_basis }}</span>
+                            {% elif m.ratio_measured %}
+                            <span class="ratio-estimate">{{ m.time_basis }}（実績{{ m.samples }}本）</span>
+                            {% else %}
+                            <span class="ratio-unmeasured">{{ m.time_basis }}</span>
+                            {% endif %}
+                        </td>
+                        <td>約{{ m.model_mem_mb }}MB</td>
+                        <td>
+                            {% if m.downloaded %}
+                            <span class="model-ready">取得済み</span>
+                            {% else %}
+                            <span class="model-missing">未取得（初回に約{{ m.download_gb }}GBのダウンロード）</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        <p class="form-hint-block">「未取得」の段階を初めて使うときは、文字起こしの前にモデルのダウンロードが走ります（回線によって数分〜数十分）。ダウンロード中はジョブ一覧に「モデル準備中」と表示され、失敗した場合はジョブが失敗として記録されます。既定の段階を変えると、次回の起動時にもそのモデルの読み込みが走ります（読み込みは裏で行うため、画面自体はすぐ開きます）。</p>
+        <p class="form-hint-block">「1時間の会議」の数字のうち「未実測の見込み」と書いてあるものは、検証用PCの実測から換算した見込みで、このサーバーで測ったものではありません。実際のジョブが2本たまると、このサーバーの実績に自動で切り替わります。また精度の比較に使った正解データは「文字起こしの出力に人が修正を入れたもの」で、独立した正解ではありません。落ちた発話は正解側にも載っていないため、実際の取りこぼしはここに出る数字より多い可能性があります。</p>
 
         <hr class="divider">
 
@@ -322,6 +405,87 @@
                 })
                 .catch(function() {
                     showStorageMsg(false, '通信エラーが発生しました');
+                });
+        });
+
+        // 精度と時間のバランス（既定の段階）
+        function showQualityMsg(ok, text) {
+            var msg = document.getElementById('quality-message');
+            msg.classList.remove('hidden-element');
+            msg.className = 'message ' + (ok ? 'message-success' : 'message-error');
+            msg.textContent = text;
+        }
+
+        document.getElementById('quality-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            var fd = new FormData();
+            fd.append('default_quality_level', document.getElementById('quality-default').value);
+            fetch('/admin/quality/save', { method: 'POST', body: fd })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.status === 'ok') {
+                        var extra = data.warning ? ' ' + data.warning : '';
+                        showQualityMsg(true, data.message + extra);
+                    } else {
+                        showQualityMsg(false, data.message || '保存に失敗しました');
+                    }
+                })
+                .catch(function() {
+                    showQualityMsg(false, '通信エラーが発生しました');
+                });
+        });
+
+        document.getElementById('quality-refresh-btn').addEventListener('click', function() {
+            var btn = this;
+            btn.disabled = true;
+            btn.textContent = '確認中...';
+            fetch('/admin/quality/models')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var tbody = document.getElementById('quality-models-tbody');
+                    tbody.innerHTML = '';
+                    for (var i = 0; i < data.models.length; i++) {
+                        var m = data.models[i];
+                        var tr = document.createElement('tr');
+                        var basis = m.time_basis;
+                        if (!m.learned && m.ratio_measured) {
+                            basis = basis + '（実績' + m.samples + '本）';
+                        }
+                        var cells = [m.level, m.name, m.model_size,
+                                     'およそ' + m.hour_minutes + '分',
+                                     basis,
+                                     '約' + m.model_mem_mb + 'MB'];
+                        for (var j = 0; j < cells.length; j++) {
+                            var td = document.createElement('td');
+                            td.textContent = cells[j];
+                            tr.appendChild(td);
+                        }
+                        var tdState = document.createElement('td');
+                        var span = document.createElement('span');
+                        if (m.downloaded) {
+                            span.className = 'model-ready';
+                            span.textContent = '取得済み';
+                        } else {
+                            span.className = 'model-missing';
+                            span.textContent = '未取得（初回に約' + m.download_gb + 'GBのダウンロード）';
+                        }
+                        tdState.appendChild(span);
+                        tr.appendChild(tdState);
+                        tbody.appendChild(tr);
+                    }
+                    var loadingNow = (data.loading || []).map(function(m) { return m.model_size; });
+                    showQualityMsg(true, 'モデルの状態を再確認しました' +
+                        (loadingNow.length
+                            ? '（いま読み込み中: ' + loadingNow.join(', ') +
+                              '。初めて使うモデルはダウンロードから始まります）'
+                            : ''));
+                })
+                .catch(function() {
+                    showQualityMsg(false, '通信エラーが発生しました');
+                })
+                .then(function() {
+                    btn.disabled = false;
+                    btn.textContent = 'モデルの状態を再確認';
                 });
         });
 

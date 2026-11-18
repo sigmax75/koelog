@@ -2,9 +2,27 @@ import os
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 RESULT_DIR = os.path.join(os.path.dirname(__file__), "results")
-MODEL_SIZE = "medium"
 DEVICE = "cpu"
-COMPUTE_TYPE = "int8"
+
+# --- モデル・量子化は presets.py が段階ごとに持つ ---
+# 2026-11-18 に「精度と時間のバランス」5段階を入れたため、使うモデルと量子化は
+# presets.PRESETS[段階] 側で決まる。下の2つは **もう読まれていない**。
+# 変えても文字起こしは変わらないので、変更は presets.py のほうで行うこと。
+# （段階3 = これまでの設定 = medium / int8。移行前の値をここに残してある）
+MODEL_SIZE = "medium"       # 未使用（presets.py を見ること）
+COMPUTE_TYPE = "int8"       # 未使用（presets.py を見ること）
+
+# 同時にメモリ上に保持する Whisper モデルの数。
+# 1 にしておくと、段階を切り替えたときに前のモデルをキャッシュから外す。
+#
+# **これでメモリが1個ぶんに収まるのは WORKER_COUNT = 1 のときだけ。**
+# WORKER_COUNT を 2 以上にすると、キャッシュから外したモデルを実行中の
+# ワーカーがまだ掴んでいるため解放されず、実メモリは同時実行数ぶん必要になる。
+# 実測（1モデル=300MBの重りで確認）: WORKER_COUNT=2 でキャッシュ上は1個でも
+# 実メモリは2個ぶん。実機換算だと medium + large-v3 で約5.2GB、
+# large-v3 を2本なら約6.8GB。16GB のサーバーで段階4・5を使うなら
+# WORKER_COUNT は 1 のままにしておくこと。
+MODEL_CACHE_SIZE = 1
 LANGUAGE = "ja"
 MAX_FILE_SIZE_MB = 500
 WORKER_COUNT = 1        # 同時に文字起こしするジョブ数（CPU保護のため1推奨）。キューは受付順
