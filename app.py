@@ -2,11 +2,14 @@
 
 import os
 import io
+import re
 import csv
 import gc
 import time
 import uuid
+import wave
 import queue
+import contextlib
 import threading
 import subprocess
 import smtplib
@@ -328,7 +331,7 @@ else:
     #
     # ここで同期的に読むと、import が終わるまで uvicorn が listen できず、
     # 読み込みの間ずっと「サーバーが無応答」に見える。
-    # 段階5(large-v3)を既定にすると、未取得なら約3.1GBのダウンロードぶん、
+    # 段階4(large-v3)を既定にすると、未取得なら約3.1GBのダウンロードぶん、
     # 取得済みでも読み込みぶん（検証PCで149秒）が丸ごと無応答時間になっていた。
     # 先に listen し、モデルは裏で用意する。
     # 用意できる前にジョブが来ても、get_model が同じロックで待つので二重には読まない。
@@ -475,21 +478,106 @@ def preprocess_audio(input_path: str) -> str:
         return input_path
 
 
-def get_audio_duration(filepath: str) -> float:
-    """ffprobeで音声の長さ（秒）を取得"""
+# ffmpeg が標準エラーに出す長さの表記を読むための正規表現。
+#   ヘッダ由来:  Duration: 00:02:10.00, start: 0.000000, bitrate: ...
+#   デコード中:  size=N/A time=00:02:10.00 bitrate=N/A speed=...
+_FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
+_FFMPEG_TIME_RE = re.compile(r"time=\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
+
+
+def _hms_to_sec(h: str, m: str, s: str) -> float:
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def _duration_from_wave(filepath: str) -> float:
+    """WAV の長さを Python 標準ライブラリで読む（外部プロセスを起動しない）
+
+    ヘッダの長さは常に信用できるわけではない。
+      * ffmpeg 等がパイプに書き出した WAV は、書き始めの時点で長さが分からないので
+        data チャンクのサイズに 0xFFFFFFFF 等の「未定」を書く。wave はこれを
+        そのままフレーム数（2147483647）として返すため、実体 6.5 秒の
+        208KB のファイルが約37時間になる。
+      * 録音中にプロセスが落ちて末尾のサイズを書き戻せなかった WAV も同じ。
+    ヘッダの言う音声データ量がファイルの実サイズを超えていたら、その長さは
+    成立しない。そういうときは 0.0 を返して、呼び出し側の ffmpeg 経路に回す
+    （ffmpeg はデコードして実際の長さを出せる）。
+    """
+    with contextlib.closing(wave.open(filepath, "rb")) as w:
+        rate = w.getframerate()
+        frames = w.getnframes()
+        block = w.getnchannels() * w.getsampwidth()   # 1フレームのバイト数
+    if rate <= 0 or frames <= 0:
+        return 0.0
+    if block > 0 and frames * block > os.path.getsize(filepath):
+        # ヘッダを信用できない（長さ未定・途中で切れた）→ ffmpeg に任せる
+        print(f"[KoeLog] WAVヘッダの長さがファイルサイズと合いません"
+              f"（frames={frames} / ffmpegで測り直します）: {filepath}")
+        return 0.0
+    return frames / float(rate)
+
+
+def _run_ffmpeg_stderr(args: list, timeout: int) -> str:
+    """ffmpeg を起動して標準エラーを返す。
+
+    長さを聞くだけの呼び出しでは ffmpeg は「出力ファイルが無い」として
+    終了コード 1 を返すのが正常なので、終了コードは見ない。
+    """
+    result = subprocess.run(
+        [config.FFMPEG_PATH, "-hide_banner", "-nostdin"] + args,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=timeout,
+    )
+    return result.stderr or ""
+
+
+def _duration_from_ffmpeg(filepath: str) -> float:
+    """ffmpeg（ffprobe ではない）から長さを取る。
+
+    ffprobe を使わないのは、サーバーのアプリケーション制御ポリシーが
+    ffprobe.exe だけをブロックしていて（WinError 4551）、長さが 0 になり
+    推定処理時間の表示と実績学習が働かなくなっていたため。
+    ポリシーは実行ファイル単位なので、前処理で使えている ffmpeg は通る。
+    """
+    # 1) まずヘッダの Duration を読む。デコードしないので長い音声でも速い
     try:
-        cmd = [
-            config.FFMPEG_PATH.replace("ffmpeg", "ffprobe"),
-            "-v", "quiet",
-            "-show_entries", "format=duration",
-            "-of", "csv=p=0",
-            filepath
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0 and result.stdout.strip():
-            return float(result.stdout.strip())
+        stderr = _run_ffmpeg_stderr(["-i", filepath], 30)
+        found = _FFMPEG_DURATION_RE.findall(stderr)
+        if found:
+            sec = _hms_to_sec(*found[0])
+            if sec > 0:
+                return sec
     except Exception as e:
-        print(f"[KoeLog] ffprobe error: {e}")
+        print(f"[KoeLog] 音声の長さの取得（ヘッダ）に失敗: {e}")
+
+    # 2) ヘッダに長さが入っていない形式（Duration: N/A）はデコードして
+    #    最後に出た time= を長さとして採る
+    try:
+        stderr = _run_ffmpeg_stderr(["-i", filepath, "-f", "null", "-"], 300)
+        found = _FFMPEG_TIME_RE.findall(stderr)
+        if found:
+            sec = _hms_to_sec(*found[-1])
+            if sec > 0:
+                return sec
+    except Exception as e:
+        print(f"[KoeLog] 音声の長さの取得（デコード）に失敗: {e}")
+
+    return 0.0
+
+
+def get_audio_duration(filepath: str) -> float:
+    """音声の長さ（秒）を取得する。取得できなければ 0.0（従来どおり続行する）"""
+    if os.path.splitext(filepath)[1].lower() == ".wav":
+        try:
+            sec = _duration_from_wave(filepath)
+            if sec > 0:
+                return sec
+        except Exception as e:
+            # 拡張子が .wav でも wave で読めない場合（圧縮WAV等）は ffmpeg に回す
+            print(f"[KoeLog] WAVヘッダを読めませんでした（ffmpegで再試行）: {e}")
+    try:
+        return _duration_from_ffmpeg(filepath)
+    except Exception as e:
+        print(f"[KoeLog] 音声の長さを取得できませんでした: {e}")
     return 0.0
 
 
