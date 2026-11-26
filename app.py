@@ -9,6 +9,7 @@ import time
 import uuid
 import wave
 import queue
+import shutil
 import contextlib
 import threading
 import subprocess
@@ -20,16 +21,36 @@ from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+# ディスクへの書き出し・ハッシュ計算など、待ちの長い処理をイベントループから
+# 追い出すために使う（アップロード中に画面が止まらないようにするため）
+from starlette.concurrency import run_in_threadpool
+# 送信中に通信が切れたことを表す例外。捕まえないと ASGI の未処理例外になり、
+# 実害が無いのにコンソールへ長い traceback が出る
+from starlette.requests import ClientDisconnect
 
 import json
 
 import config
 import presets
+import audio_pipeline
+import uploadstore
+from audio_pipeline import MediaError
+from uploadstore import UploadError
 
 # --- 検証用モック（KOELOG_MOCK=1 のときだけ faster-whisper を使わない） ---
 MOCK_MODE = os.environ.get("KOELOG_MOCK") == "1"
 if not MOCK_MODE:
     from faster_whisper import WhisperModel
+
+# KOELOG_SKIP_FFMPEG=1 で ffmpeg の処理（取り出し・再生用コピー）を丸ごと飛ばす。
+#
+# KOELOG_MOCK=1 は「faster-whisper を呼ばない」だけの意味にしてある。
+# モックでも ffmpeg は動かす。そうしないと、今回の主目的である
+# 「動画から音声をはがす」をモックで検証できない（以前は MOCK=1 で
+# ffmpeg 前処理ごと飛ばしていた）。
+# ffmpeg が入っていないPCで従来どおりの軽いモック検証をしたいときは、
+# KOELOG_MOCK=1 と合わせて KOELOG_SKIP_FFMPEG=1 を指定する。
+SKIP_FFMPEG = os.environ.get("KOELOG_SKIP_FFMPEG") == "1"
 
 # --- 設定ファイル ---
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
@@ -170,6 +191,126 @@ def test_storage_path(path: str, create: bool = False):
     except OSError as e:
         return {"status": "error", "message": f"書き込みできません: {e.strerror or e}"}
     return {"status": "ok", "message": "OK（書き込み可能）"}
+
+
+# --- ディスクの空き検査 ---
+#
+# サイズの上限は置かない方針なので、守りはここ1か所だけ。
+# **アップロードを始める前に**断ることが大事。全部送り終わってから
+# 「容量不足で失敗」が一番たちが悪い（送信時間が丸ごと無駄になる）。
+
+def _gb(num_bytes: float) -> float:
+    return round(num_bytes / (1024 ** 3), 2)
+
+
+def _size_text(num_bytes: float) -> str:
+    """人が読む大きさの表記。1GB 未満は MB で出す。
+
+    すべて GB で出すと、短い音声のぶんが「0.0GB」になって何も伝わらない。
+    """
+    if num_bytes >= 1024 ** 3:
+        return f"{_gb(num_bytes)}GB"
+    if num_bytes >= 1024 ** 2:
+        return f"{round(num_bytes / 1024 ** 2)}MB"
+    return f"{max(1, round(num_bytes / 1024))}KB"
+
+
+def estimate_required_bytes(size_bytes: int, duration_sec: float = 0.0) -> dict:
+    """このファイルを処理しきるのに必要なディスク量の見積もり（内訳つき）
+
+    内訳:
+      * アップロードするファイルそのもの
+      * 取り出した 16kHz/モノラルの WAV（約115MB/時間）
+      * 再生用の軽い音声コピー（WAV の約1/8）
+      * 安全余裕（ドライブをぎりぎりまで埋めない）
+
+    音声の長さが分からない時点で呼ばれることがある（アップロード開始前は
+    まだファイルがサーバーに無い）。そのときは WAV のぶんを
+    config.WAV_UNKNOWN_FLOOR_GB（既定 1GB ＝ 約8.7時間ぶん）で見込む。
+    """
+    size_bytes = max(0, int(size_bytes or 0))
+    if duration_sec and duration_sec > 0:
+        wav = (duration_sec / 3600.0) * config.WAV_MB_PER_HOUR * 1024 ** 2
+    else:
+        wav = config.WAV_UNKNOWN_FLOOR_GB * 1024 ** 3
+    playback = wav / 8.0
+    reserve = config.DISK_RESERVE_GB * 1024 ** 3
+    total = size_bytes + wav + playback + reserve
+    return {
+        "upload_bytes": size_bytes,
+        "wav_bytes": wav,
+        "playback_bytes": playback,
+        "reserve_bytes": reserve,
+        "total_bytes": total,
+        "duration_known": bool(duration_sec and duration_sec > 0),
+    }
+
+
+def check_disk_space(target_dir: str, size_bytes: int, duration_sec: float = 0.0,
+                     already_received: int = 0,
+                     exclude_upload_id: str = "") -> dict:
+    """保存先の空きが足りるか調べる。足りなければ理由つきのメッセージを返す。
+
+    **進行中のアップロードが確保しているぶんを差し引いてから判定する。**
+    `shutil.disk_usage().free` だけを見ていた時期は、2本の `/upload/init` が
+    同時に来るとどちらも「空いている」と判断して両方受け付け、空きを
+    二重取りしていた（実測: 空き13.3GB に 9.3GB × 2本が 200 で通った）。
+    送信途中で実際に空きが尽きると `PUT /chunk` が 507 を返し、
+    フロントはこれを再試行しないので、送信にかけた時間が丸ごと無駄になる。
+
+    exclude_upload_id: 再開の検査では、その受付自身を予約から除く
+      （already_received を引いた必要量と二重になるため）。
+
+    戻り値: {"ok": bool, "message": str, ...内訳}
+    """
+    need = estimate_required_bytes(size_bytes, duration_sec)
+    # 再開のときは、すでに届いているぶんはもう確保済みなので差し引く
+    need["total_bytes"] -= max(0, int(already_received or 0))
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        usage = shutil.disk_usage(target_dir)
+        free = usage.free
+    except OSError as e:
+        return {
+            "ok": False,
+            "message": (f"保存先の空き容量を確認できませんでした: {target_dir} "
+                        f"（{getattr(e, 'strerror', None) or e}）"),
+            "free_bytes": 0, "reserved_bytes": 0, "usable_bytes": 0, **need,
+        }
+    # 進行中（受付済み・未完了）のアップロードが、これから書き込む予定の量。
+    # 掃除で消える古い断片は数えない（数えると空きが永久に減る）。
+    try:
+        reserved = uploadstore.pending_reserved_bytes(
+            target_dir, exclude_upload_id,
+            float(getattr(config, "UPLOAD_PART_TTL_HOURS", 24)))
+    except Exception as e:
+        # ここで落として受付を止めない（従来どおり free だけで判定する）
+        print(f"[KoeLog] 進行中アップロードの予約量を数えられませんでした: {e}")
+        reserved = 0
+    usable = max(0, free - reserved)
+    extra = {"free_bytes": free, "reserved_bytes": reserved,
+             "usable_bytes": usable}
+    if usable >= need["total_bytes"]:
+        return {"ok": True, "message": "", **extra, **need}
+
+    wav_note = "約" if need["duration_known"] else "最低"
+    reserved_note = ""
+    if reserved > 0:
+        reserved_note = (
+            f"（うち {_size_text(reserved)} は進行中の別のアップロードが確保中。"
+            f"いますぐ使えるのは {_size_text(usable)}）\n")
+    message = (
+        f"保存先（{target_dir}）の空き容量が足りないため、アップロードを始められません。\n"
+        f"いまの空き: {_size_text(free)} / 必要な見込み: {_size_text(need['total_bytes'])}\n"
+        f"{reserved_note}"
+        f"内訳: このファイル {_size_text(need['upload_bytes'])} ＋ "
+        f"変換後の音声 {wav_note}{_size_text(need['wav_bytes'])} ＋ "
+        f"再生用コピー 約{_size_text(need['playback_bytes'])} ＋ "
+        f"安全余裕 {_size_text(need['reserve_bytes'])}\n"
+        f"空きを増やすか、管理画面の「保存先」を空きのあるドライブに変えてから、"
+        f"もう一度お試しください。"
+    )
+    return {"ok": False, "message": message, **extra, **need}
 
 
 # --- Custom Dictionary ---
@@ -391,6 +532,16 @@ def build_job_view(job: dict, position_map: dict) -> dict:
         "elapsed_sec": job.get("elapsed_sec", 0),
         "model_load_sec": job.get("model_load_sec", 0),
         "transcribe_sec": job.get("transcribe_sec", 0),
+        # 音声の取り出し（動画からのはがし）にかかった時間。
+        # 所要時間の実績（倍率）からはこれも差し引く。差し引かないと
+        # 動画を通したときだけ倍率が膨らんで、推定処理時間が狂う。
+        "extract_sec": job.get("extract_sec", 0),
+        # 動画だった場合に混ぜた音声トラックの本数（1なら単一）
+        "audio_streams": job.get("audio_streams", 0),
+        # 処理後に元ファイル（数GBの動画など）を消したかどうか
+        "original_removed": bool(job.get("original_removed")),
+        # 失敗ではないが利用者に伝えるべきこと（ffmpeg が無い等）
+        "warning": job.get("warning", ""),
     }
 
 
@@ -404,8 +555,13 @@ def build_job_list():
 
 
 def remove_job_files(job: dict):
-    """ジョブに紐づくファイルを削除"""
-    for key in ("upload_path", "result_path"):
+    """ジョブに紐づくファイルを削除
+
+    playback_path（再生用の軽い音声コピー）も必ず含める。
+    含めないと、元ファイルを消したあとにジョブを削除したとき、
+    コピーだけが保存先に残り続ける。
+    """
+    for key in ("upload_path", "result_path", "playback_path"):
         p = job.get(key)
         if p and os.path.exists(p):
             try:
@@ -452,37 +608,86 @@ def format_result(segments_data, output_format):
         return "\n".join(f"[{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}] {seg['text']}" for seg in segments_data)
 
 
-def preprocess_audio(input_path: str) -> str:
-    """ffmpegで16kHz/モノラル/ノーマライズに変換"""
+def prepare_media(job: dict) -> str:
+    """元ファイル（音声でも動画でも）から文字起こし用の WAV を作り、そのパスを返す。
+
+    旧 `preprocess_audio` の置き換え。変わった点は3つ。
+
+      1. **動画でも同じ道を通る。** 音声トラックを ffmpeg ではがす。
+         トラックが複数あれば全部混ぜる（既定の「チャンネル数が最多の1本」では
+         参加者ごとにトラックが分かれた録画で一部の声が黙って落ちる）。
+      2. **300秒のタイムアウトを撤廃した。** 何時間かかってもよい。
+         そのかわり進捗が止まったときだけ失敗させる（audio_pipeline 側）。
+      3. **黙って元ファイルで続行しない。** 失敗は MediaError として投げ、
+         ジョブを「失敗」にして理由を画面に出す。
+
+    例外: ffmpeg がそもそもインストールされていない場合だけは、従来どおり
+    前処理なしで続行する（音声ファイルだけを扱っていた従来の運用を壊さない
+    ため）。ただし黙ってではなく job["warning"] に残して画面に出す。
+    """
+    input_path = job["upload_path"]
     output_path = input_path + ".preprocessed.wav"
+
+    if not audio_pipeline.ffmpeg_available():
+        # ここで失敗にすると、ffmpeg 無しで音声ファイルだけ使っていた
+        # 従来の運用が全部止まる。続行はするが、黙ってはいない。
+        job["warning"] = ("ffmpeg が見つからないため、音声の前処理（16kHz化・"
+                          "音量の正規化）を省きました。動画ファイルはこの状態では"
+                          "処理できません。サーバーに ffmpeg を用意してください。")
+        print(f"[KoeLog] ffmpeg が見つかりません（前処理をスキップ）: "
+              f"FFMPEG_PATH={config.FFMPEG_PATH}")
+        return input_path
+
+    job["phase"] = "extract"
+    t0 = time.time()
+    info = audio_pipeline.probe_media(input_path)
+    job["audio_streams"] = info.audio_streams
+    if info.duration_sec > 0:
+        job["duration_sec"] = round(info.duration_sec, 1)
+        job["estimated_sec"] = presets.estimate_sec(
+            info.duration_sec, job.get("quality_level"), get_quality_stats())
+    if info.audio_streams > 1:
+        print(f"[KoeLog] 音声トラックが {info.audio_streams} 本あります。"
+              f"全部混ぜて文字起こしします job={job['job_id']}")
+
+    # 第2段階ではここに progress_cb を渡して「取り出し ○%」を画面に出す。
+    # いまは取り出しの進捗は画面に出さない（第1段階の範囲外）。
+    audio_pipeline.extract_audio(input_path, output_path, info)
+    job["extract_sec"] = round(time.time() - t0, 1)
+    print(f"[KoeLog] 音声の取り出し完了 job={job['job_id']} "
+          f"{job['extract_sec']}秒 トラック数={info.audio_streams} "
+          f"video={info.video_streams}")
+    return output_path
+
+
+def make_playback_copy_for(job: dict, wav_path: str):
+    """再生用の軽い音声コピーを作る。作れたら job に記録する。
+
+    元ファイル（数GBの動画）を消す前に必ず呼ぶ。
+    **コピーを作れなかったときは元ファイルを消さない**（消すと既存の
+    「音声再生＋タイムスタンプ連動シーク」が動かなくなる）。
+    """
+    if wav_path == job["upload_path"]:
+        # 前処理が走っていない（ffmpeg が無い）。コピーも作れない
+        return None
+    out = os.path.join(os.path.dirname(job["upload_path"]),
+                       f"{job['job_id']}.play.mp3")
     try:
-        cmd = [
-            config.FFMPEG_PATH, "-y", "-i", input_path,
-            "-ar", "16000",      # 16kHzリサンプリング
-            "-ac", "1",          # モノラル
-            "-af", "loudnorm",   # ラウドネスノーマライズ
-            "-f", "wav",
-            output_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0 and os.path.exists(output_path):
-            return output_path
-        else:
-            print(f"[KoeLog] ffmpeg前処理失敗（元ファイルを使用）: {result.stderr[:200]}")
-            return input_path
-    except FileNotFoundError:
-        print("[KoeLog] ffmpegが見つかりません。前処理をスキップします。")
-        return input_path
+        audio_pipeline.make_playback_copy(wav_path, out)
     except Exception as e:
-        print(f"[KoeLog] ffmpeg前処理エラー: {e}")
-        return input_path
+        print(f"[KoeLog] 再生用コピーを作れませんでした（元ファイルは残します）"
+              f" job={job['job_id']}: {e}")
+        return None
+    job["playback_path"] = out
+    return out
 
 
 # ffmpeg が標準エラーに出す長さの表記を読むための正規表現。
 #   ヘッダ由来:  Duration: 00:02:10.00, start: 0.000000, bitrate: ...
-#   デコード中:  size=N/A time=00:02:10.00 bitrate=N/A speed=...
+# デコード中の `time=` を読む経路（丸ごとデコードする2段目）は
+# 2026-11-26 に撤去したので、その正規表現も置いていない
+# （長時間ファイルで本処理とディスク I/O を取り合うため。_duration_from_ffmpeg 参照）。
 _FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
-_FFMPEG_TIME_RE = re.compile(r"time=\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
 
 
 def _hms_to_sec(h: str, m: str, s: str) -> float:
@@ -537,8 +742,22 @@ def _duration_from_ffmpeg(filepath: str) -> float:
     ffprobe.exe だけをブロックしていて（WinError 4551）、長さが 0 になり
     推定処理時間の表示と実績学習が働かなくなっていたため。
     ポリシーは実行ファイル単位なので、前処理で使えている ffmpeg は通る。
+
+    **ヘッダの Duration だけを読む。デコードはしない。**
+    以前はヘッダに長さが無いとき（`Duration: N/A`）の2段目として
+    `-f null -` でファイルを丸ごとデコードし、最後の `time=` を長さとして
+    採っていたが、撤去した。理由:
+      * ここは受付直後に別スレッドで走る。長時間ファイル（926MB の動画など）だと
+        丸ごとデコードする ffmpeg が、本処理の取り出し用 ffmpeg と並走して
+        ディスク I/O を取り合う。**本処理を遅くする**
+      * 得られるのは推定処理時間の表示だけ（便利機能）。失敗しても 0.0 を
+        返して文字起こしは通る。本処理と I/O を取り合う価値がない
+      * 残っていた `timeout=300` は、長時間ファイルでは「長さは分からないまま
+        5分 I/O を食って終わる」という最悪の形になっていた
+    長さが分からないときは 0.0 を返す。画面は `duration_sec > 0` /
+    `estimated_sec > 0` のときだけ表示するので、欄が空のまま壊れない。
+    正確な長さは、ワーカーの取り出し処理（prepare_media）が後から入れ直す。
     """
-    # 1) まずヘッダの Duration を読む。デコードしないので長い音声でも速い
     try:
         stderr = _run_ffmpeg_stderr(["-i", filepath], 30)
         found = _FFMPEG_DURATION_RE.findall(stderr)
@@ -549,18 +768,8 @@ def _duration_from_ffmpeg(filepath: str) -> float:
     except Exception as e:
         print(f"[KoeLog] 音声の長さの取得（ヘッダ）に失敗: {e}")
 
-    # 2) ヘッダに長さが入っていない形式（Duration: N/A）はデコードして
-    #    最後に出た time= を長さとして採る
-    try:
-        stderr = _run_ffmpeg_stderr(["-i", filepath, "-f", "null", "-"], 300)
-        found = _FFMPEG_TIME_RE.findall(stderr)
-        if found:
-            sec = _hms_to_sec(*found[-1])
-            if sec > 0:
-                return sec
-    except Exception as e:
-        print(f"[KoeLog] 音声の長さの取得（デコード）に失敗: {e}")
-
+    print(f"[KoeLog] ヘッダに長さがありませんでした（推定処理時間は表示しません）: "
+          f"{os.path.basename(filepath)}")
     return 0.0
 
 
@@ -709,8 +918,21 @@ def process_job(job_id: str):
     preprocessed_path = None
     t_start = time.time()   # 所要時間の実測（前処理＋文字起こし）
     try:
-        # ffmpeg前処理（モック時はスキップ）
-        preprocessed_path = filepath if MOCK_MODE else preprocess_audio(filepath)
+        # 音声の取り出し（動画ならここで音声をはがす）。
+        #
+        # KOELOG_MOCK=1 は「faster-whisper を呼ばない」だけの意味にしてある。
+        # ffmpeg は動かす（そうしないと動画からの取り出しをモックで検証できない）。
+        # ffmpeg の無いPCで従来どおりモック検証したいときは
+        # KOELOG_SKIP_FFMPEG=1 を足す。
+        if SKIP_FFMPEG:
+            preprocessed_path = filepath
+        else:
+            preprocessed_path = prepare_media(job)
+
+        # 再生用の軽い音声コピーを、**元ファイルを消す前に**作っておく。
+        # これが作れていないときは後段で元ファイルを消さない。
+        if not SKIP_FFMPEG:
+            make_playback_copy_for(job, preprocessed_path)
 
         text = run_transcription(job, preprocessed_path)
 
@@ -735,11 +957,22 @@ def process_job(job_id: str):
         # モデルの用意（読み込み・初回ダウンロード）は音声の長さに比例しない固定費。
         # 実績の倍率はこれを除いた「実際に文字起こしにかかった時間」で測る。
         # 除かないと、初回のダウンロードが乗った1本目だけで倍率が何倍にも膨らむ。
+        # 音声の取り出し（動画からのはがし）も、モデルの用意と同じく
+        # 「文字起こしそのものではない時間」なので倍率から外す。
+        # 外さないと、動画を通したときだけ実績の倍率が膨らむ。
         model_sec = float(job.get("model_load_sec") or 0)
-        job["transcribe_sec"] = round(max(0.0, job["elapsed_sec"] - model_sec), 1)
+        extract_sec = float(job.get("extract_sec") or 0)
+        job["transcribe_sec"] = round(
+            max(0.0, job["elapsed_sec"] - model_sec - extract_sec), 1)
         print(f"[KoeLog] 処理完了 {job['completed_at']} job={job_id} "
-              f"所要={job['elapsed_sec']}秒（うちモデル準備={model_sec}秒）"
+              f"所要={job['elapsed_sec']}秒（うちモデル準備={model_sec}秒 "
+              f"音声の取り出し={extract_sec}秒）"
               f" 段階={job.get('quality_level')}")
+
+        # 元ファイル（数GBの動画など）を消す。再生用の軽いコピーだけ残す。
+        # 残すとディスクが動画のぶんだけ増え続け、いずれ「空きが無い」が
+        # 手作業の原因になる（オーナー判断1）。
+        remove_original_file(job)
 
         # 推定処理時間を実機に合わせていくため、実績を記録する（モックは除く）
         if not MOCK_MODE:
@@ -749,6 +982,15 @@ def process_job(job_id: str):
         # メール通知
         send_notification(job.get("email", ""), job)
 
+    except MediaError as e:
+        # 音声の取り出しに関する失敗。message は利用者向けの日本語なので
+        # そのまま画面に出す（黙って続行はしない）。
+        # 失敗したジョブの元ファイルは再試行できるように残す。
+        job["error"] = e.message
+        job["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        job["status"] = "failed"
+        print(f"[KoeLog] 音声の取り出しに失敗 job={job_id}: {e.message} "
+              f"/ detail: {e.detail}")
     except Exception as e:
         job["error"] = str(e)
         job["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -761,6 +1003,34 @@ def process_job(job_id: str):
                 os.remove(preprocessed_path)
             except OSError:
                 pass
+
+
+def remove_original_file(job: dict):
+    """処理が終わった元ファイル（数GBの動画など）を消す。
+
+    消すのは次の条件がそろったときだけ。
+      * 再生用の軽い音声コピーが実在する
+        （無いまま消すとプレビューの音声再生とタイムスタンプ連動シークが壊れる）
+      * 元ファイルとコピーが別物である
+
+    失敗したジョブでは呼ばない（再試行できるように元ファイルを残す）。
+    """
+    play = job.get("playback_path")
+    orig = job.get("upload_path")
+    if not orig or not os.path.exists(orig):
+        return
+    if not play or not os.path.exists(play) or os.path.abspath(play) == os.path.abspath(orig):
+        print(f"[KoeLog] 再生用コピーが無いため元ファイルは残します job={job['job_id']}")
+        return
+    try:
+        size = os.path.getsize(orig)
+        os.remove(orig)
+        job["original_removed"] = True
+        print(f"[KoeLog] 元ファイルを削除しました job={job['job_id']} "
+              f"({_gb(size)}GB) 再生用コピーを残しています: "
+              f"{os.path.basename(play)} ({_gb(os.path.getsize(play))}GB)")
+    except OSError as e:
+        print(f"[KoeLog] 元ファイルを削除できませんでした job={job['job_id']}: {e}")
 
 
 def queue_worker(worker_no: int):
@@ -780,6 +1050,50 @@ for _i in range(WORKER_COUNT):
     threading.Thread(target=queue_worker, args=(_i + 1,), daemon=True).start()
 
 
+def _cleanup_parts_once():
+    """中断されたまま放置されたアップロードの断片を掃除する。
+
+    放っておくと数GBの断片がディスクに残り続け、「空きが無い」という形で
+    結局また手作業（容量の確保）の原因になる。
+    """
+    try:
+        ttl = float(getattr(config, "UPLOAD_PART_TTL_HOURS", 24))
+        n = uploadstore.cleanup_stale(get_upload_dir(), ttl)
+        if n:
+            print(f"[KoeLog] 中断されたアップロードの断片を {n} 件片付けました"
+                  f"（{ttl}時間以上更新なし）")
+    except Exception as e:
+        print(f"[KoeLog] アップロード断片の掃除に失敗しました: {e}")
+
+
+def _cleanup_parts_daemon():
+    """起動時に1回、そのあと1日1回掃除する"""
+    _cleanup_parts_once()
+    while True:
+        time.sleep(24 * 3600)
+        _cleanup_parts_once()
+
+
+threading.Thread(target=_cleanup_parts_daemon, daemon=True,
+                 name="koelog-parts-cleanup").start()
+
+# --- 第2段階で足すもの（ここに置く） ---
+#
+#  * ジョブの永続化・再開: `jobstore.py` を新設し、起動時に
+#    「waiting はキューへ、processing は waiting に戻す」復元をこの位置で行う。
+#    いま jobs は dict（メモリのみ）なので、再起動で履歴が消える。
+#    uploadstore._atomic_write_json と同じ「一時ファイル → os.replace」で書く。
+#  * 孤児ファイルの掃除: プロセスが強制終了されると
+#    `<uuid>.<ext>.preprocessed.wav` が残る（finally は走らない）。
+#    上の _cleanup_parts_once と同じ場所に、jobs に無い preprocessed.wav を
+#    消す処理を足す。
+#  * チャンク分割の文字起こしと進捗: process_job の中で
+#    audio_pipeline.find_split_points() → チャンクごとに model.transcribe()
+#    → `work/<job_id>/chunk_NNNN.json` にチェックポイント。
+#    進捗（処理済み秒／全体秒）は job["progress_sec"] に書き、
+#    build_job_view で画面へ渡す。
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """メイン画面"""
@@ -787,93 +1101,492 @@ async def index(request: Request):
     return templates.TemplateResponse("index.html", {
         "request": request,
         "jobs": job_list,
-        "max_file_size_mb": config.MAX_FILE_SIZE_MB,
-        "allowed_extensions": ", ".join(sorted(config.ALLOWED_EXTENSIONS)),
+        # サイズ上限・拡張子の白リストは撤廃したのでテンプレートにも渡さない
+        "upload_chunk_mb": config.UPLOAD_CHUNK_MB,
         "quality_levels": presets.ui_levels(get_quality_stats()),
         "default_quality_level": get_default_quality_level(),
     })
 
 
-@app.post("/upload")
-async def upload(file: UploadFile = File(...), email: str = Form(""), output_format: str = Form("timestamp"), field: str = Form("general"), custom_prompt: str = Form(""), username: str = Form(""), quality_level: str = Form("")):
-    """音声ファイルアップロード → ジョブ作成"""
-    # 拡張子チェック
-    _, ext = os.path.splitext(file.filename or "")
-    ext = ext.lower()
-    if ext not in config.ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"非対応のファイル形式です。対応形式: {', '.join(sorted(config.ALLOWED_EXTENSIONS))}"
-        )
+# --- アップロード共通 ---
 
-    # ファイル読み込み
-    contents = await file.read()
+_EXT_RE = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
 
-    # サイズチェック
-    size_mb = len(contents) / (1024 * 1024)
-    if size_mb > config.MAX_FILE_SIZE_MB:
-        raise HTTPException(
-            status_code=400,
-            detail=f"ファイルサイズが上限({config.MAX_FILE_SIZE_MB}MB)を超えています。({size_mb:.1f}MB)"
-        )
 
-    # ジョブ作成（保存先は受付時点の設定で確定。以後の設定変更は次のジョブから）
-    job_id = str(uuid.uuid4())
-    safe_filename = f"{job_id}{ext}"
-    upload_dir = get_upload_dir()
-    result_dir = get_result_dir()
-    # 段階も受付時点で確定する（未指定・不正値は管理画面の既定段階）
-    level = (quality_level or "").strip()
+def safe_ext(filename: str) -> str:
+    """保存名に使う拡張子を取り出す。
+
+    **対応形式の判定には使わない。** 拡張子の白リストは撤廃した
+    （絞ると、その都度利用者が手で変換することになる）。読めるかどうかは
+    ffmpeg 自身に判定させる（audio_pipeline.probe_media）。
+    ここで形を確かめているのは、保存するファイル名に変な文字を混ぜないためだけ。
+    """
+    ext = os.path.splitext(filename or "")[1].lower()
+    return ext if _EXT_RE.match(ext) else ""
+
+
+def _job_settings_from(data: dict) -> dict:
+    """ブラウザから届いた設定を、ジョブ用に正規化する。
+
+    quality_level（画面で選んだ段階）が届かないと、画面上は選べているのに
+    管理画面の既定段階で処理されてしまう。過去に実際に起きた不具合なので、
+    ここを通る値は必ず1か所で確定させる。
+    """
+    level = str(data.get("quality_level") or "").strip()
     level = presets.normalize_level(level) if level else get_default_quality_level()
-    try:
-        os.makedirs(upload_dir, exist_ok=True)
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"アップロード先フォルダを作成できません: {upload_dir} ({e.strerror or e})")
-    filepath = os.path.abspath(os.path.join(upload_dir, safe_filename))
+    return {
+        "email": str(data.get("email") or "").strip(),
+        "output_format": str(data.get("output_format") or "timestamp"),
+        "field": str(data.get("field") or "general"),
+        "custom_prompt": str(data.get("custom_prompt") or "").strip(),
+        "username": str(data.get("username") or "").strip() or "anonymous",
+        "quality_level": level,
+    }
 
-    try:
-        with open(filepath, "wb") as f:
-            f.write(contents)
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"アップロード先に書き込めません: {upload_dir} ({e.strerror or e})")
 
-    # 音声の長さを取得
-    duration = get_audio_duration(filepath)
+def register_job(filename: str, filepath: str, size_bytes: int,
+                 settings: dict, duration_hint: float = 0.0) -> dict:
+    """保存済みのファイルからジョブを作ってキューに入れる。
 
+    **音声の長さはここでは測らない。** 旧実装は `async def upload` の中から
+    同期の `get_audio_duration()` を呼んでいて、長い・遅い形式のときに
+    イベントループを占有し、サーバー全体（他の人の画面も）が止まっていた。
+    いまは
+      * ブラウザが測れた長さ（duration_hint）を暫定値として使い、
+      * 正確な値は別スレッドの先読み（_probe_duration_async）と
+        ワーカーの取り出し処理（prepare_media）で後から入れ直す。
+    """
+    job_id = os.path.splitext(os.path.basename(filepath))[0]
+    level = settings["quality_level"]
+    duration = max(0.0, float(duration_hint or 0.0))
     with jobs_lock:
         jobs[job_id] = {
             "job_id": job_id,
             "seq": next_seq(),
-            "filename": file.filename,
+            "filename": filename,
             "status": "waiting",
             "progress": 0,
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "started_at": None,
             "completed_at": None,
             "result_path": None,
-            "result_dir": result_dir,
+            "result_dir": get_result_dir(),
             "error": None,
             "upload_path": filepath,
-            "file_size_mb": round(size_mb, 1),
-            "email": email.strip(),
-            "output_format": output_format,
+            # 再生用の軽い音声コピー（処理後に元ファイルを消したあとはこちらを再生する）
+            "playback_path": None,
+            "original_removed": False,
+            "warning": "",
+            "file_size_mb": round(size_bytes / (1024 * 1024), 1),
+            "email": settings["email"],
+            "output_format": settings["output_format"],
             "duration_sec": round(duration, 1),
             # 推定処理時間は段階ごとに変わる。このサーバーの実績があればそれを使う
             "estimated_sec": presets.estimate_sec(duration, level, get_quality_stats()),
             "quality_level": level,
-            "field": field,
-            "custom_prompt": custom_prompt.strip(),
-            "username": username.strip() or "anonymous",
+            "field": settings["field"],
+            "custom_prompt": settings["custom_prompt"],
+            "username": settings["username"],
+            "audio_streams": 0,
+            "extract_sec": 0,
         }
+        job = jobs[job_id]
+
+    # 長さの先読みは別スレッドで（イベントループを止めない）
+    threading.Thread(target=_probe_duration_async, args=(job_id,), daemon=True,
+                     name=f"koelog-probe-{job_id[:8]}").start()
 
     # FIFOキューの末尾に追加（ワーカーが受付順に処理）
     job_queue.put(job_id)
+    return job
+
+
+def _probe_duration_async(job_id: str):
+    """受付後に音声の長さを測って、待機中の推定時間の表示に反映する。
+
+    ワーカーの取り出し処理でも測り直すので、ここが失敗しても処理は進む。
+    イベントループとは別のスレッドなので、遅い形式でも画面は止まらない。
+    """
+    with jobs_lock:
+        job = jobs.get(job_id)
+        path = job.get("upload_path") if job else None
+    if not path or not os.path.exists(path):
+        return
+    try:
+        duration = get_audio_duration(path)
+    except Exception as e:
+        print(f"[KoeLog] 長さの先読みに失敗しました job={job_id}: {e}")
+        return
+    if duration <= 0:
+        return
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job or job.get("status") not in ("waiting", "processing"):
+            return
+        job["duration_sec"] = round(duration, 1)
+        job["estimated_sec"] = presets.estimate_sec(
+            duration, job.get("quality_level"), get_quality_stats())
+
+
+# --- 分割アップロード（上限なし・途中から再開できる） ---
+#
+# 流れ:
+#   1. POST /upload/init          ファイル名とサイズを申告。**ここで空き容量を検査**
+#   2. PUT  /upload/{id}/chunk    16MB ずつ生のバイナリで送る（multipart を使わない）
+#   3. POST /upload/{id}/finish   サイズを照合して本来の置き場所へ移し、ジョブを作る
+#   補助: GET /upload/{id}（どこまで届いたか）/ POST /upload/{id}/abort（破棄）
+#
+# multipart を使わない理由: starlette の multipart は OS の一時フォルダ
+# （通常 C:）に SpooledTemporaryFile を作るので、ファイルが
+# 「一時フォルダ → メモリ → 保存先」と最大3回扱われる。保存先ドライブだけで
+# 完結させたいので、生のボディをストリームで受けて直接 .part に追記する。
+
+# 「空きの判定 → 受付の作成（予約の成立）」を直列にするためのロック。
+# 握っているあいだは await しないこと（await すると他のリクエストが
+# この区間に入り込み、二重取りの穴が戻る）。
+_upload_init_lock = threading.Lock()
+
+
+@app.post("/upload/init")
+async def upload_init(request: Request):
+    """アップロードの受付。**送り始める前に**空き容量を検査して、足りなければ断る。"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="受付情報（JSON）を読めませんでした")
+
+    filename = str(body.get("filename") or "").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="ファイル名が空です")
+    try:
+        size = int(body.get("size") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="ファイルサイズの指定が正しくありません")
+    if size <= 0:
+        raise HTTPException(status_code=400, detail="ファイルサイズが 0 です（中身が空のファイルは処理できません）")
+    resume_key = str(body.get("resume_key") or "")
+    try:
+        duration_hint = float(body.get("duration_sec") or 0)
+    except (TypeError, ValueError):
+        duration_hint = 0.0
+
+    upload_dir = get_upload_dir()
+    try:
+        os.makedirs(upload_dir, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"アップロード先フォルダを作成できません: {upload_dir} "
+                   f"({getattr(e, 'strerror', None) or e})")
+
+    # 「空きの判定」と「受付の作成（＝予約の成立）」は**ひとまとまりで行う**。
+    #
+    # 分けていると、判定と作成のあいだに別の init が割り込み、両方が
+    # 「空いている」と判断して空きを二重取りする（実測で再現した不具合）。
+    # 作成が終わって初めて `.part` と meta ができ、
+    # uploadstore.pending_reserved_bytes から見えるようになるため、
+    # ここを直列にしないと予約そのものが意味を持たない。
+    #
+    # この区間では await しない（＝イベントループを手放さない）ので、
+    # 同じループの別リクエストにも、別スレッドにも割り込まれない。
+    # 中身はディスクの空き取得・断片フォルダの一覧・小さなファイル作成だけで、
+    # 大きな入出力は含まない。
+    with _upload_init_lock:
+        # 途中まで届いている同じファイルがあれば、その続きから
+        try:
+            existing = uploadstore.find_by_resume_key(upload_dir, resume_key)
+        except Exception:
+            existing = None
+        received = 0
+        resumed = False
+        if existing and int(existing.get("size", 0)) == size:
+            upload_id = existing["upload_id"]
+            received = uploadstore.received_bytes(upload_dir, upload_id)
+            resumed = True
+        else:
+            upload_id = None
+
+        # **空き容量の検査はここ。**送り終わってから失敗させない。
+        # 再開のときは自分自身を予約から除く（already_received と二重になる）。
+        disk = check_disk_space(upload_dir, size, duration_hint,
+                                already_received=received,
+                                exclude_upload_id=upload_id or "")
+        if not disk["ok"]:
+            return JSONResponse(status_code=507, content={
+                "status": "error",
+                "detail": disk["message"],
+                "free_gb": _gb(disk["free_bytes"]),
+                "reserved_gb": _gb(disk.get("reserved_bytes", 0)),
+                "usable_gb": _gb(disk.get("usable_bytes", disk["free_bytes"])),
+                "required_gb": _gb(disk["total_bytes"]),
+            })
+
+        if upload_id is None:
+            meta = uploadstore.create(upload_dir, filename, size, resume_key,
+                                      safe_ext(filename))
+            upload_id = meta["upload_id"]
+        elif existing.get(uploadstore.RELEASED_KEY):
+            # 前回の送信が失敗して予約を手放していた受付を、続きから再開する。
+            # **空きの検査に通ったあとに**印を下ろす（通らなければ手放したまま）。
+            uploadstore.reactivate(upload_dir, existing)
+
+    return JSONResponse(content={
+        "status": "ok",
+        "upload_id": upload_id,
+        "received": received,
+        "size": size,
+        "resumed": resumed,
+        "chunk_size": config.UPLOAD_CHUNK_MB * 1024 * 1024,
+        "free_gb": _gb(disk["free_bytes"]),
+        "reserved_gb": _gb(disk.get("reserved_bytes", 0)),
+        "usable_gb": _gb(disk.get("usable_bytes", disk["free_bytes"])),
+        "required_gb": _gb(disk["total_bytes"]),
+    })
+
+
+@app.get("/upload/{upload_id}")
+async def upload_state(upload_id: str):
+    """どこまで届いているか（ブラウザが再開位置を知るため）"""
+    upload_dir = get_upload_dir()
+    try:
+        meta = uploadstore.load_meta(upload_dir, upload_id)
+    except UploadError as e:
+        return JSONResponse(status_code=e.status_code,
+                            content={"status": "error", "detail": e.message})
+    return JSONResponse(content={
+        "status": "ok",
+        "upload_id": upload_id,
+        "received": uploadstore.received_bytes(upload_dir, upload_id),
+        "size": int(meta.get("size", 0)),
+        "filename": meta.get("filename", ""),
+    })
+
+
+@app.put("/upload/{upload_id}/chunk")
+async def upload_chunk(upload_id: str, request: Request, offset: int = 0):
+    """断片を1つ受け取って追記する。
+
+    **ファイル全体をメモリに載せない。** ここで扱うのは1断片だけなので、
+    ファイルが何GBでもサーバーのメモリ使用量は変わらない。
+    申告より大きい断片は途中で打ち切る（メモリを守る）。
+
+    **メモリに載る上限は、断片の既定（config.UPLOAD_CHUNK_MB = 16MB）の
+    2倍の 32MB。** 16MB ちょうどで打ち切らないのは、ブラウザが送る1断片の
+    実バイト数が設定値とぴったり一致しない場合（最後の断片・将来
+    UPLOAD_CHUNK_MB を変えたときの古いタブ・API を直接叩く利用者）に、
+    正しい送信を 413 で弾いてしまわないため。2倍までは受け取り、
+    それを超えたら打ち切る。
+    """
+    upload_dir = get_upload_dir()
+    # 既定 16MB の2倍 = 32MB まで受け取る（理由は上の docstring）
+    limit = config.UPLOAD_CHUNK_MB * 1024 * 1024 * 2
+    buf = bytearray()
+    try:
+        async for part in request.stream():
+            buf.extend(part)
+            if len(buf) > limit:
+                return JSONResponse(status_code=413, content={
+                    "status": "error",
+                    "detail": (f"1回に送れる大きさの上限"
+                               f"（{config.UPLOAD_CHUNK_MB * 2}MB）を超えています"
+                               f"（通常は {config.UPLOAD_CHUNK_MB}MB ずつ送ります）"),
+                })
+    except ClientDisconnect:
+        # 送信中に通信が切れた（ブラウザを閉じた・回線が落ちた）。
+        # **途中まで届いた分は追記しない**（追記するとファイルが壊れる）。
+        # ブラウザは次に `GET /upload/{id}` で現在位置を聞いて続きから送り直す。
+        # ここで捕まえないと ClientDisconnect が ASGI の未処理例外になり、
+        # 画面に何の問題も無いのにコンソールへ長い traceback が出る。
+        print(f"[KoeLog] 送信が途中で切れました（追記していません）"
+              f" upload_id={upload_id} offset={offset} "
+              f"受信途中={len(buf)}バイト / 続きから再開できます")
+        return JSONResponse(status_code=499, content={
+            "status": "error",
+            "detail": "送信が途中で切れました。続きから送り直してください。",
+            "received": uploadstore.received_bytes(upload_dir, upload_id),
+        })
+    data = bytes(buf)
+    del buf
+    if not data:
+        return JSONResponse(status_code=400,
+                            content={"status": "error", "detail": "中身が空の断片です"})
+
+    try:
+        # 1断片ごとに壊れていないか確かめる（sha256 が使えない環境では crc32）
+        verified = uploadstore.verify_chunk(
+            data,
+            request.headers.get("x-chunk-sha256", ""),
+            request.headers.get("x-chunk-crc32", ""),
+        )
+        received = await run_in_threadpool(
+            uploadstore.append_chunk, upload_dir, upload_id, int(offset), data)
+    except UploadError as e:
+        content = {"status": "error", "detail": e.message}
+        content.update(e.extra)
+        return JSONResponse(status_code=e.status_code, content=content)
+    except OSError as e:
+        return JSONResponse(status_code=507, content={
+            "status": "error",
+            "detail": (f"アップロード先に書き込めませんでした: "
+                       f"{getattr(e, 'strerror', None) or e}"
+                       f"（ディスクの空きが尽きた可能性があります）"),
+        })
+    return JSONResponse(content={"status": "ok", "received": received,
+                                 "verified": verified})
+
+
+@app.post("/upload/{upload_id}/finish")
+async def upload_finish(upload_id: str, request: Request):
+    """受信完了 → サイズとハッシュを確認 → ジョブ作成・キュー投入"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    upload_dir = get_upload_dir()
+    try:
+        meta = uploadstore.load_meta(upload_dir, upload_id)
+        ext = meta.get("ext") or safe_ext(meta.get("filename", ""))
+        job_id = str(uuid.uuid4())
+        dest = os.path.abspath(os.path.join(upload_dir, f"{job_id}{ext}"))
+        # サイズ照合と全体ハッシュの計算はディスクを読むので別スレッドで
+        done = await run_in_threadpool(uploadstore.finish, upload_dir, upload_id, dest)
+    except UploadError as e:
+        content = {"status": "error", "detail": e.message}
+        content.update(e.extra)
+        return JSONResponse(status_code=e.status_code, content=content)
+    except OSError as e:
+        return JSONResponse(status_code=500, content={
+            "status": "error",
+            "detail": f"ファイルを保存先に移せませんでした: "
+                      f"{getattr(e, 'strerror', None) or e}",
+        })
+
+    settings = _job_settings_from(body)
+    try:
+        duration_hint = float(body.get("duration_sec") or 0)
+    except (TypeError, ValueError):
+        duration_hint = 0.0
+    job = register_job(meta.get("filename", f"{job_id}{ext}"), dest,
+                       done.get("final_size", 0), settings, duration_hint)
+    position = len(waiting_job_ids_in_order())
+    print(f"[KoeLog] 受付完了 job={job['job_id']} file={job['filename']} "
+          f"{job['file_size_mb']}MB sha256={done.get('sha256')} "
+          f"段階={settings['quality_level']}")
+    return JSONResponse(content={
+        "job_id": job["job_id"], "status": "ok", "queue_position": position,
+        "quality_level": settings["quality_level"],
+        "quality_name": presets.get(settings["quality_level"])["name"],
+        # 繋いだファイルが壊れていないことの確認に使える（検証・ログ用）
+        "sha256": done.get("sha256", ""),
+        "size": done.get("final_size", 0),
+    })
+
+
+@app.post("/upload/{upload_id}/abort")
+async def upload_abort(upload_id: str, keep: int = 0):
+    """アップロードを中断する。
+
+    keep=0（既定）: 断片ごと破棄する。利用者が「外す」を押したとき
+      （このファイルはもう上げない、という意思表示）に使う。
+    keep=1: **ディスクの空きの予約だけを手放し、断片は残す。**
+      送信が失敗したときに画面から呼ぶ。こうすると
+        * 失敗した送信が他のアップロードを最長24時間ブロックしなくなる
+        * それでも同じファイルを上げ直せば**続きから**再開できる
+      の両方が成り立つ。残った断片は、再開されなければ
+      `UPLOAD_PART_TTL_HOURS` の掃除で消える。
+    """
+    upload_dir = get_upload_dir()
+    if keep:
+        released = uploadstore.release(upload_dir, upload_id)
+        return JSONResponse(content={"status": "ok", "released": bool(released),
+                                     "kept": bool(released)})
+    uploadstore.delete(upload_dir, upload_id)
+    return JSONResponse(content={"status": "ok", "released": True, "kept": False})
+
+
+@app.post("/upload")
+async def upload(request: Request, file: UploadFile = File(...), email: str = Form(""), output_format: str = Form("timestamp"), field: str = Form("general"), custom_prompt: str = Form(""), username: str = Form(""), quality_level: str = Form("")):
+    """音声・動画ファイルの一括アップロード → ジョブ作成（従来方式・互換用）
+
+    画面は分割アップロード（/upload/init → chunk → finish）を使う。
+    こちらは API を直接叩いている自動化のために残してある。
+
+    変わった点:
+      * サイズ上限と拡張子の白リストを撤廃した
+      * `await file.read()` でファイル全体をメモリに載せるのをやめ、
+        1MB ずつ読んでディスクへ書き出す形にした
+      * 音声の長さの取得をここでは行わない（イベントループを止めないため）
+    """
+    ext = safe_ext(file.filename or "")
+    upload_dir = get_upload_dir()
+    try:
+        os.makedirs(upload_dir, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"アップロード先フォルダを作成できません: {upload_dir} ({e.strerror or e})")
+
+    # 送られてくる大きさが分かるなら、書き始める前に空きを確かめる。
+    #
+    # Content-Length は multipart 全体の大きさなので、ファイル本体より
+    # 少し大きい（境界文字列と他のフォーム項目を含む）。見積もりとしては
+    # 安全側に出るので、そのまま必要量の計算に使う。
+    # 取れないとき（chunked 等）は何もしない。その場合でも書き込みに失敗すれば
+    # 下の except OSError が 507 を返すので、安全側には倒れる。
+    #
+    # ここで断れると、保存先に書き始めてから失敗するのを防げる
+    # （分割アップロードの /upload/init と同じ考え方）。
+    #
+    # **限界を書いておく:** multipart の解析は、この関数に入る前に
+    # フレームワーク側で終わっている（UploadFile はそのとき作られる）。
+    # つまりここで断れるのは「保存先への書き込み」より前であって、
+    # 「本体の受信」より前ではない。受信そのものを始める前に断りたいなら、
+    # 画面と同じ分割アップロード（/upload/init）を使うこと。
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared > 0:
+        disk = check_disk_space(upload_dir, declared)
+        if not disk["ok"]:
+            raise HTTPException(status_code=507, detail=disk["message"])
+
+    job_id = str(uuid.uuid4())
+    filepath = os.path.abspath(os.path.join(upload_dir, f"{job_id}{ext}"))
+
+    size = 0
+    try:
+        with open(filepath, "wb") as f:
+            while True:
+                buf = await file.read(1024 * 1024)
+                if not buf:
+                    break
+                size += len(buf)
+                f.write(buf)
+    except OSError as e:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+        raise HTTPException(status_code=507, detail=f"アップロード先に書き込めません: {upload_dir} ({getattr(e, 'strerror', None) or e})")
+
+    if size == 0:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail="中身が空のファイルです")
+
+    settings = _job_settings_from({
+        "email": email, "output_format": output_format, "field": field,
+        "custom_prompt": custom_prompt, "username": username,
+        "quality_level": quality_level,
+    })
+    job = register_job(file.filename, filepath, size, settings)
     position = len(waiting_job_ids_in_order())
 
     return JSONResponse(content={
-        "job_id": job_id, "status": "ok", "queue_position": position,
-        "quality_level": level,
-        "quality_name": presets.get(level)["name"],
+        "job_id": job["job_id"], "status": "ok", "queue_position": position,
+        "quality_level": settings["quality_level"],
+        "quality_name": presets.get(settings["quality_level"])["name"],
     })
 
 
@@ -937,16 +1650,36 @@ async def preview(job_id: str):
     return JSONResponse(content={"text": text, "filename": job["filename"], "job_id": job_id})
 
 
+#  拡張子 → media_type（元ファイルを返す場合の宣言用）
+_AUDIO_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4", ".ogg": "audio/ogg", ".oga": "audio/ogg",
+    ".opus": "audio/ogg", ".flac": "audio/flac", ".webm": "audio/webm",
+}
+
+
 @app.get("/audio/{job_id}")
 async def audio(job_id: str):
-    """Stream audio file for playback"""
+    """プレビューの音声再生用。
+
+    処理が終わったジョブでは元ファイル（数GBの動画）を消しているので、
+    **再生用の軽い音声コピー（mp3）を返す。**
+    コピーが無い場合（処理前・失敗・ffmpeg 無し）は元ファイルを返す。
+    タイムスタンプ連動シークは時間軸が同じなのでそのまま動く
+    （コピーは取り出した音声そのままで、頭を落としたりしていない）。
+    """
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    play_path = job.get("playback_path")
+    if play_path and os.path.exists(play_path):
+        return FileResponse(path=play_path, media_type="audio/mpeg")
     upload_path = job.get("upload_path")
     if not upload_path or not os.path.exists(upload_path):
         raise HTTPException(status_code=404, detail="Audio file not found")
-    return FileResponse(path=upload_path, media_type="audio/mpeg")
+    ext = os.path.splitext(upload_path)[1].lower()
+    return FileResponse(path=upload_path,
+                        media_type=_AUDIO_MEDIA_TYPES.get(ext, "audio/mpeg"))
 
 
 @app.post("/save/{job_id}")

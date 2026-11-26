@@ -151,6 +151,11 @@
 
         .file-item-state.is-error {
             color: #ff6e6e;
+            /* 空き容量不足の理由のように長い文章が入るので、折り返して1行使う。
+               nowrap のままだと 375px の画面で横にはみ出す */
+            white-space: normal;
+            flex: 1 1 100%;
+            min-width: 0;
         }
 
         .file-item-state.is-done {
@@ -669,9 +674,8 @@
                 <div id="dropzone" class="dropzone">
                     <div class="dropzone-icon">&#127908;</div>
                     <div class="dropzone-text">ファイルをドラッグ&ドロップ、またはクリックして選択（複数可）</div>
-                    <div class="dropzone-sub">対応形式: {{ allowed_extensions }} / 最大 {{ max_file_size_mb }}MB / 追加した順にキューで処理します</div>
-                    <input type="file" name="file" id="file-input" class="file-input-hidden" multiple
-                           accept=".mp3,.wav,.m4a,.ogg,.flac,.webm">
+                    <div class="dropzone-sub">音声・動画のどちらでも、ffmpeg が読める形式ならそのまま入れてください（mp4 / mov / mkv などの動画は音声を自動で取り出します）。<strong>サイズの上限はありません。</strong>保存先の空きが足りないときだけ、送り始める前にお知らせします。追加した順にキューで処理します。</div>
+                    <input type="file" name="file" id="file-input" class="file-input-hidden" multiple>
                 </div>
                 <ul id="file-list" class="file-list"></ul>
                 <div id="file-summary" class="file-summary"></div>
@@ -778,6 +782,9 @@
                                         {% if job.phase == "model" %}
                                         <span class="status-badge status-processing">モデル準備中</span>
                                         <div class="elapsed-text">初めて使う段階では、ここでモデルのダウンロードが走ります（数分〜数十分）</div>
+                                        {% elif job.phase == "extract" %}
+                                        <span class="status-badge status-processing">音声を取り出し中</span>
+                                        <div class="elapsed-text">動画から音声をはがしています（長いファイルでは時間がかかります）</div>
                                         {% else %}
                                         <span class="status-badge status-processing">処理中</span>
                                         {% endif %}
@@ -788,6 +795,9 @@
                                         {% if job.error %}
                                         <div class="error-text">{{ job.error }}</div>
                                         {% endif %}
+                                    {% endif %}
+                                    {% if job.warning %}
+                                    <div class="error-text">{{ job.warning }}</div>
                                     {% endif %}
                                 </td>
                                 <td>{{ job.created_at }}</td>
@@ -849,8 +859,13 @@
         // 送信待ちファイル（追加した順。送信中に追加しても末尾に入る）
         var pendingFiles = [];
         var isUploading = false;
-        var MAX_FILE_SIZE_MB = {{ max_file_size_mb }};
-        var ALLOWED_EXT = ['.mp3', '.wav', '.m4a', '.ogg', '.flac', '.webm'];
+        // 1回に送る断片の大きさ。サーバー側は1断片ぶんしかメモリに載せないので、
+        // ファイルが何GBでもメモリ使用量は変わらない
+        var CHUNK_SIZE = {{ upload_chunk_mb }} * 1024 * 1024;
+        var MAX_CHUNK_RETRY = 5;
+        // サイズ上限と拡張子の白リストは撤廃した。
+        // 形式を絞ると、対応外のたびに利用者が手で変換することになるため。
+        // 読めるかどうかの判定はサーバー側の ffmpeg が行う。
 
         // ユーザー名をlocalStorageから復元
         var usernameInput = document.getElementById('username-input');
@@ -945,14 +960,14 @@
         function addFiles(fileList) {
             for (var i = 0; i < fileList.length; i++) {
                 var f = fileList[i];
-                var ext = (f.name.lastIndexOf('.') >= 0 ? f.name.substring(f.name.lastIndexOf('.')) : '').toLowerCase();
-                var item = { file: f, name: f.name, sizeMB: f.size / (1024 * 1024), duration: null, state: 'pending', message: '' };
-                if (ALLOWED_EXT.indexOf(ext) < 0) {
+                // 拡張子・サイズでの門前払いはしない（上限撤廃・白リスト撤廃）。
+                // 読めない形式はサーバーの ffmpeg が理由つきで断る。
+                var item = { file: f, name: f.name, sizeMB: f.size / (1024 * 1024),
+                             duration: null, state: 'pending', message: '',
+                             sent: 0, uploadId: null };
+                if (f.size === 0) {
                     item.state = 'error';
-                    item.message = '非対応形式';
-                } else if (item.sizeMB > MAX_FILE_SIZE_MB) {
-                    item.state = 'error';
-                    item.message = 'サイズ超過';
+                    item.message = '中身が空のファイルです';
                 }
                 pendingFiles.push(item);
                 if (item.state === 'pending') probeDuration(item);
@@ -984,8 +999,20 @@
         function removePending(index) {
             if (index < 0 || index >= pendingFiles.length) return;
             if (pendingFiles[index].state === 'uploading') return;
+            // 利用者が自分で「外す」を押した = このファイルはもう上げない。
+            // 途中まで届いている断片も、確保していた空きも、ここで手放す
+            // （残しても再開されないので、ディスクに置いておく意味がない）
+            dropUploadRemains(pendingFiles[index]);
             pendingFiles.splice(index, 1);
             renderFileList();
+        }
+
+        // 送信中でない行を捨てるときの後始末（「外す」「クリア」から呼ぶ）
+        function dropUploadRemains(item) {
+            if (!item || !item.uploadId) return;
+            if (item.state === 'done') return;   // 受付済み。断片はもう無い
+            abortUpload(item.uploadId, false);
+            item.uploadId = '';
         }
 
         function renderFileList() {
@@ -1026,6 +1053,10 @@
         }
 
         clearBtn.addEventListener('click', function() {
+            // 捨てる行の後始末（断片と予約を手放す）を先に済ませる
+            pendingFiles.forEach(function(it) {
+                if (it.state !== 'uploading') dropUploadRemains(it);
+            });
             pendingFiles = pendingFiles.filter(function(it) { return it.state === 'uploading'; });
             renderFileList();
         });
@@ -1047,80 +1078,323 @@
             uploadOne(idx);
         }
 
+        // --- 分割アップロード ---
+        //
+        // ファイルを CHUNK_SIZE ずつ切って順番に送る。やっていること:
+        //   * ブラウザもファイル全体をメモリに載せない（File.slice で読み出す）
+        //   * 1断片ずつハッシュを付けて送り、壊れていたら送り直す
+        //   * 通信が切れたら、最初からではなく **続きから** 送り直す
+        //   * ページを閉じて開き直し、同じファイルを選び直しても続きから
+        //     （サーバーが「ファイル名｜サイズ｜最終更新日時」で受付を覚えている）
+
+        // CRC32。crypto.subtle は http で LAN の IP を開いたときに使えないため
+        // （secure context ではないので undefined になる）、常に使える手段を用意する
+        var CRC32_TABLE = (function() {
+            var table = new Uint32Array(256);
+            for (var n = 0; n < 256; n++) {
+                var c = n;
+                for (var k = 0; k < 8; k++) {
+                    c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+                }
+                table[n] = c >>> 0;
+            }
+            return table;
+        })();
+
+        function crc32Hex(arrayBuffer) {
+            var bytes = new Uint8Array(arrayBuffer);
+            var crc = 0xFFFFFFFF;
+            for (var i = 0; i < bytes.length; i++) {
+                crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ bytes[i]) & 0xFF];
+            }
+            crc = (crc ^ 0xFFFFFFFF) >>> 0;
+            var hex = crc.toString(16);
+            while (hex.length < 8) hex = '0' + hex;
+            return hex;
+        }
+
+        function bufToHex(buffer) {
+            var bytes = new Uint8Array(buffer);
+            var out = '';
+            for (var i = 0; i < bytes.length; i++) {
+                var h = bytes[i].toString(16);
+                out += (h.length === 1 ? '0' + h : h);
+            }
+            return out;
+        }
+
+        // 断片を読み込んで、ハッシュ付きの送信データを作る
+        function readAndHash(blob) {
+            return new Promise(function(resolve, reject) {
+                var reader = new FileReader();
+                reader.onload = function() { resolve(reader.result); };
+                reader.onerror = function() {
+                    reject(new Error('ファイルを読み取れませんでした（移動または削除された可能性があります）'));
+                };
+                reader.readAsArrayBuffer(blob);
+            }).then(function(ab) {
+                var canSha = (window.crypto && window.crypto.subtle && window.crypto.subtle.digest);
+                if (!canSha) {
+                    return { data: ab, size: ab.byteLength, headers: { 'X-Chunk-CRC32': crc32Hex(ab) } };
+                }
+                return window.crypto.subtle.digest('SHA-256', ab).then(function(d) {
+                    return { data: ab, size: ab.byteLength, headers: { 'X-Chunk-SHA256': bufToHex(d) } };
+                }).catch(function() {
+                    return { data: ab, size: ab.byteLength, headers: { 'X-Chunk-CRC32': crc32Hex(ab) } };
+                });
+            });
+        }
+
+        function delay(ms) {
+            return new Promise(function(resolve) { setTimeout(resolve, ms); });
+        }
+
+        function formatBytes(n) {
+            if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(2) + 'GB';
+            return (n / (1024 * 1024)).toFixed(1) + 'MB';
+        }
+
+        function uploadProgressEls() {
+            return {
+                container: document.getElementById('upload-progress'),
+                bar: document.getElementById('upload-progress-bar'),
+                text: document.getElementById('upload-progress-text'),
+                label: document.getElementById('upload-progress-label')
+            };
+        }
+
+        function showUploadProgress(item, bytesSent, note) {
+            var els = uploadProgressEls();
+            var total = item.file.size || 1;
+            var pct = Math.min(100, Math.round((bytesSent / total) * 100));
+            item.pct = pct;
+            els.container.classList.remove('hidden-element');
+            els.bar.style.width = pct + '%';
+            els.text.textContent = pct + '%';
+            els.label.textContent = '送信中: ' + item.name + '（' +
+                formatBytes(bytesSent) + ' / ' + formatBytes(total) + '）' +
+                (note ? ' ' + note : '') +
+                ' ／ 通信が切れても、続きから自動で送り直します';
+            renderFileList();
+        }
+
+        // 断片を1つ送る（失敗は呼び出し側で再試行）
+        function putChunk(item, offset, hashed) {
+            return new Promise(function(resolve, reject) {
+                var xhr = new XMLHttpRequest();
+                xhr.open('PUT', '/upload/' + item.uploadId + '/chunk?offset=' + offset, true);
+                for (var k in hashed.headers) {
+                    if (hashed.headers.hasOwnProperty(k)) xhr.setRequestHeader(k, hashed.headers[k]);
+                }
+                xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+                xhr.upload.addEventListener('progress', function(e) {
+                    if (e.lengthComputable) showUploadProgress(item, offset + e.loaded, '');
+                });
+
+                function fail(msg, fatal) {
+                    var err = new Error(msg);
+                    err.fatal = !!fatal;
+                    reject(err);
+                }
+
+                xhr.onload = function() {
+                    var data = {};
+                    try { data = JSON.parse(xhr.responseText) || {}; } catch (e) {}
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        item.sent = (typeof data.received === 'number') ? data.received : (offset + hashed.size);
+                        showUploadProgress(item, item.sent, '');
+                        resolve();
+                        return;
+                    }
+                    if (xhr.status === 409 && typeof data.received === 'number') {
+                        // 送信位置がずれていた（応答だけ失われた等）。サーバーの位置に合わせて続行
+                        item.sent = data.received;
+                        showUploadProgress(item, item.sent, '（送信位置を合わせました）');
+                        resolve();
+                        return;
+                    }
+                    // 413/507/404/400 は送り直しても直らないので、ここで止める。
+                    // 422（断片が壊れていた）・499（送信中に切れた）・5xx は送り直す
+                    var retryable = (xhr.status === 422 || xhr.status === 499
+                                     || xhr.status >= 500) && xhr.status !== 507;
+                    fail(data.detail || ('アップロードに失敗しました (' + xhr.status + ')'), !retryable);
+                };
+                xhr.onerror = function() { fail('通信エラー', false); };
+                xhr.ontimeout = function() { fail('通信がタイムアウトしました', false); };
+                xhr.send(hashed.data);
+            });
+        }
+
+        // サーバーに「どこまで届いているか」を聞いて位置を合わせる
+        function syncOffset(item) {
+            return fetch('/upload/' + item.uploadId)
+                .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+                .then(function(res) {
+                    if (!res.ok) {
+                        var err = new Error(res.data.detail || 'アップロードの受付情報が見つかりません');
+                        err.fatal = true;
+                        throw err;
+                    }
+                    item.sent = res.data.received || 0;
+                });
+        }
+
+        function sendOneChunk(item, attempt) {
+            var start = item.sent;
+            var end = Math.min(start + CHUNK_SIZE, item.file.size);
+            var blob = item.file.slice(start, end);
+            return readAndHash(blob)
+                .then(function(hashed) { return putChunk(item, start, hashed); })
+                .catch(function(err) {
+                    if (err.fatal || attempt + 1 >= MAX_CHUNK_RETRY) throw err;
+                    var wait = Math.pow(2, attempt) * 1000;
+                    var els = uploadProgressEls();
+                    els.label.textContent = '送信が中断されました（' + (err.message || '通信エラー') +
+                        '）。' + (wait / 1000) + '秒後に続きから送り直します（' +
+                        (attempt + 2) + '/' + MAX_CHUNK_RETRY + '回目）';
+                    return delay(wait)
+                        .then(function() { return syncOffset(item); })
+                        .then(function() { return sendOneChunk(item, attempt + 1); });
+                });
+        }
+
+        function sendAllChunks(item) {
+            if (item.sent >= item.file.size) return Promise.resolve();
+            return sendOneChunk(item, 0).then(function() { return sendAllChunks(item); });
+        }
+
+        function currentUploadSettings() {
+            var form = document.getElementById('upload-form');
+            return {
+                username: form.username.value,
+                email: form.email.value,
+                output_format: form.output_format.value,
+                field: form.field.value,
+                custom_prompt: form.custom_prompt.value,
+                // 画面で選んだ段階。これを送り忘れると、選んでも管理画面の既定段階で
+                // 処理されてしまう（画面上は選べているように見えるので気づきにくい）。
+                // 分割アップロードではジョブが finish の時点で作られるので、
+                // **finish に必ず載せる**こと
+                quality_level: form.quality_level.value
+            };
+        }
+
+        function postJson(url, body) {
+            return fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            }).then(function(r) {
+                return r.json().then(function(d) { return { ok: r.ok, status: r.status, data: d }; })
+                    .catch(function() { return { ok: r.ok, status: r.status, data: {} }; });
+            });
+        }
+
+        // 中断の後始末をサーバーに伝える。
+        //
+        // keepPart=true  … 予約だけ手放す（断片は残す＝続きから再開できる）。
+        //                  送信が失敗したときに使う
+        // keepPart=false … 断片ごと破棄する。利用者が「外す」を押したときに使う
+        //
+        // **投げたら結果は見ない。** 後始末が失敗しても、画面に出ている
+        // 本来のエラー表示を上書きしてはいけない（後始末のために原因が
+        // 消えたら本末転倒）。残った断片は 24 時間の掃除でいずれ消える。
+        function abortUpload(uploadId, keepPart) {
+            if (!uploadId) return;
+            try {
+                fetch('/upload/' + uploadId + '/abort' + (keepPart ? '?keep=1' : ''),
+                      { method: 'POST' })
+                    .catch(function() { /* 後始末の失敗は無視する */ });
+            } catch (e) { /* 同上 */ }
+        }
+
+        function releaseUploadHold(item) {
+            if (!item || !item.uploadId) return;
+            abortUpload(item.uploadId, true);
+            // 二重に投げないよう、手放したことを覚えておく
+            item.holdReleased = true;
+        }
+
         function uploadOne(idx) {
             var item = pendingFiles[idx];
             item.state = 'uploading';
             item.pct = 0;
+            item.sent = 0;
             renderFileList();
 
-            var form = document.getElementById('upload-form');
-            var formData = new FormData();
-            formData.append('file', item.file, item.name);
-            formData.append('username', form.username.value);
-            formData.append('email', form.email.value);
-            formData.append('output_format', form.output_format.value);
-            formData.append('field', form.field.value);
-            formData.append('custom_prompt', form.custom_prompt.value);
-            // 画面で選んだ段階。これを送り忘れると、選んでも管理画面の既定段階で
-            // 処理されてしまう（画面上は選べているように見えるので気づきにくい）
-            formData.append('quality_level', form.quality_level.value);
-
-            var progressContainer = document.getElementById('upload-progress');
-            var progressBar = document.getElementById('upload-progress-bar');
-            var progressText = document.getElementById('upload-progress-text');
-            var progressLabel = document.getElementById('upload-progress-label');
-            progressContainer.classList.remove('hidden-element');
-            progressLabel.textContent = '送信中: ' + item.name;
-
-            var xhr = new XMLHttpRequest();
-            xhr.open('POST', '/upload', true);
-
-            xhr.upload.addEventListener('progress', function(e) {
-                if (e.lengthComputable) {
-                    var pct = Math.round((e.loaded / e.total) * 100);
-                    item.pct = pct;
-                    progressBar.style.width = pct + '%';
-                    progressText.textContent = pct + '%';
-                    renderFileList();
-                }
-            });
+            var settings = currentUploadSettings();
+            var els = uploadProgressEls();
+            els.container.classList.remove('hidden-element');
+            els.label.textContent = '送信の準備中: ' + item.name;
 
             function finishOne() {
-                progressBar.style.width = '0%';
-                progressText.textContent = '0%';
+                var e2 = uploadProgressEls();
+                e2.bar.style.width = '0%';
+                e2.text.textContent = '0%';
                 refreshStatus();
                 var next = nextPendingIndex();
                 if (next >= 0) {
                     uploadOne(next);
                 } else {
                     isUploading = false;
-                    progressContainer.classList.add('hidden-element');
-                    progressLabel.textContent = '';
+                    e2.container.classList.add('hidden-element');
+                    e2.label.textContent = '';
                     // 投入済みの行は一覧から消す（エラーは残す）
                     pendingFiles = pendingFiles.filter(function(it) { return it.state !== 'done'; });
                     renderFileList();
                 }
             }
 
-            xhr.onload = function() {
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    item.state = 'done';
-                } else {
-                    item.state = 'error';
-                    var msg = 'アップロード失敗 (' + xhr.status + ')';
-                    try { msg = JSON.parse(xhr.responseText).detail || msg; } catch (e) {}
-                    item.message = msg;
+            // 同じファイルだと分かるようにするための鍵（再開に使う）
+            var resumeKey = item.name + '|' + item.file.size + '|' + (item.file.lastModified || 0);
+
+            postJson('/upload/init', {
+                filename: item.name,
+                size: item.file.size,
+                resume_key: resumeKey,
+                duration_sec: item.duration || 0
+            }).then(function(res) {
+                if (!res.ok) {
+                    var err = new Error(res.data.detail || 'アップロードを開始できませんでした');
+                    err.fatal = true;
+                    throw err;
                 }
+                item.uploadId = res.data.upload_id;
+                item.sent = res.data.received || 0;
+                if (res.data.resumed && item.sent > 0) {
+                    showUploadProgress(item, item.sent, '（前回の続きから再開します）');
+                } else {
+                    showUploadProgress(item, item.sent, '');
+                }
+                return sendAllChunks(item);
+            }).then(function() {
+                els.label.textContent = 'ファイルの確認中: ' + item.name;
+                var body = { duration_sec: item.duration || 0 };
+                for (var k in settings) {
+                    if (settings.hasOwnProperty(k)) body[k] = settings[k];
+                }
+                return postJson('/upload/' + item.uploadId + '/finish', body);
+            }).then(function(res) {
+                if (!res.ok) throw new Error(res.data.detail || 'アップロードの仕上げに失敗しました');
+                item.state = 'done';
+                item.message = '';
                 finishOne();
-            };
-
-            xhr.onerror = function() {
+            }).catch(function(err) {
                 item.state = 'error';
-                item.message = '通信エラー';
+                // 空き容量不足の理由などは複数行で届く。一覧の1行に入れるので
+                // 改行は「 / 」に置き換える（HTML では改行がそのまま出ないため）
+                item.message = ((err && err.message) || 'アップロードに失敗しました')
+                    .replace(/\n+/g, ' / ');
+                // **確保していたディスクの空きを手放す。**
+                // ここで手放さないと、失敗した送信が最長24時間ぶん
+                // 他の人のアップロードをブロックしうる（受付のときに
+                // 「これから書く予定の量」を予約しているため）。
+                // keep=1 なので断片は残り、同じファイルを選び直せば
+                // 続きから再開できる。失敗しても画面の表示は変えない
+                releaseUploadHold(item);
                 finishOne();
-            };
-
-            xhr.send(formData);
+            });
         }
 
         // 「まとめて送信」
@@ -1191,11 +1465,20 @@
                             // 何十分も進まない理由が利用者に分からない
                             html += '<td><span class="status-badge status-processing">モデル準備中</span>';
                             html += '<div class="elapsed-text">初めて使う段階では、ここでモデルのダウンロードが走ります（数分〜数十分）</div>';
+                        } else if (job.status === 'processing' && job.phase === 'extract') {
+                            // 動画から音声をはがしている段階。長いファイルではここも時間がかかる
+                            html += '<td><span class="status-badge status-processing">音声を取り出し中</span>';
+                            html += '<div class="elapsed-text">動画から音声をはがしています（長いファイルでは時間がかかります）</div>';
                         } else {
                             html += '<td>' + (statusLabels[job.status] || escapeHtml(job.status));
                         }
                         if (job.status === 'failed' && job.error) {
                             html += '<div class="error-text">' + escapeHtml(job.error) + '</div>';
+                        }
+                        // 失敗ではないが伝えるべきこと（ffmpeg が無く前処理を省いた等）。
+                        // 黙って品質が落ちた状態で終わらせないため
+                        if (job.warning) {
+                            html += '<div class="error-text">' + escapeHtml(job.warning) + '</div>';
                         }
                         if (job.status === 'waiting' && job.estimated_sec > 0) {
                             var estMin = Math.floor(job.estimated_sec / 60);
